@@ -148,24 +148,6 @@ func (bf *BloomFilter) hash(key string, hashIndex uint) uint {
 	return uint(hasher.Sum32())
 }
 
-// FalsePositiveRate estimates the false positive rate of this bloom filter.
-// Formula: (1 - e^(-k*n/m))^k
-// where k=hash functions, n=inserted keys, m=bit array size
-func (bf *BloomFilter) FalsePositiveRate(insertedKeys int) float64 {
-	if insertedKeys <= 0 {
-		return 0.0
-	}
-
-	k := float64(bf.hashFunctions)
-	n := float64(insertedKeys)
-	m := float64(bf.size)
-
-	// Calculate: (1 - e^(-k*n/m))^k
-	exponent := -k * n / m
-	base := 1.0 - math.Exp(exponent)
-	return math.Pow(base, k)
-}
-
 // Serialize converts the bloom filter to bytes for storage.
 // This is used when writing SSTable metadata to disk.
 func (bf *BloomFilter) Serialize() []byte {
@@ -238,7 +220,3 @@ func (bf *BloomFilter) Size() uint {
 	return bf.size
 }
 
-// HashFunctions returns the number of hash functions used.
-func (bf *BloomFilter) HashFunctions() uint {
-	return bf.hashFunctions
-}
