@@ -219,4 +219,3 @@ func DeserializeBloomFilter(data []byte) (*BloomFilter, error) {
 func (bf *BloomFilter) Size() uint {
 	return bf.size
 }
-
