@@ -27,6 +27,7 @@ service AdminService {
   rpc RemoveNode(RemoveNodeRequest) returns (RemoveNodeResponse);
   rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc GetKeyOwnership(KeyOwnershipRequest) returns (KeyOwnershipResponse);
 }
 
 // Consistency levels
@@ -246,4 +247,14 @@ message ClusterMetrics {
   int64 total_requests = 2;
   double avg_latency_ms = 3;
   double qps = 4;
+}
+
+message KeyOwnershipRequest {
+  string key = 1;
+  int32 replicas = 2;
+}
+
+message KeyOwnershipResponse {
+  string key = 1;
+  repeated string nodes = 2;
 }

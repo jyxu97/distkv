@@ -413,6 +413,18 @@ func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *proto.Clus
 	}, nil
 }
 
+func (s *AdminServiceImpl) GetKeyOwnership(ctx context.Context, req *proto.KeyOwnershipRequest) (*proto.KeyOwnershipResponse, error) {
+	count := int(req.Replicas)
+	if count <= 0 {
+		count = 3
+	}
+	nodes := s.server.consistentHash.GetNodes(req.Key, count)
+	return &proto.KeyOwnershipResponse{
+		Key:   req.Key,
+		Nodes: nodes,
+	}, nil
+}
+
 // Helper functions for proto conversion
 
 func convertVectorClockFromProto(protoVC *proto.VectorClock) *consensus.VectorClock {
