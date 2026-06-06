@@ -54,23 +54,35 @@ echo "$VAL" | grep -q "distkv-quorum-test" && pass "Quorum replication: data con
 
 # ──────────────────────────────────────────────────────────────
 echo ""
-echo "=== Test 2: Pod-Failure Recovery ==="
-info "Writing key before failure..."
-kv_put "failure-key" "survives-restart"
+echo "=== Test 2: Pod-Failure Recovery + Anti-Entropy ==="
+info "Writing key while pod-0 is alive (pod-0 holds a replica)..."
+kv_put "ae-before-key" "before-failure"
 
-info "Deleting pod distkv-0 (simulating failure)..."
+info "Deleting pod distkv-0 (simulating crash)..."
 kubectl delete pod -n $NS ${STS}-0
 
-info "Waiting for pod to restart..."
+info "Writing 3 keys via pod-1 WHILE pod-0 is down (missed writes)..."
+kubectl exec -n $NS ${STS}-1 -- ./distkv-client -server=localhost:8080 put "ae-missed-1" "missed-value-1" 2>&1
+kubectl exec -n $NS ${STS}-1 -- ./distkv-client -server=localhost:8080 put "ae-missed-2" "missed-value-2" 2>&1
+kubectl exec -n $NS ${STS}-1 -- ./distkv-client -server=localhost:8080 put "ae-missed-3" "missed-value-3" 2>&1
+info "3 missed keys written (ae-missed-1..3); pod-0 never saw these writes"
+
+info "Waiting for pod-0 to restart..."
 sleep 5
 kubectl wait --for=condition=Ready pod/${STS}-0 -n $NS --timeout=120s
 pass "Pod distkv-0 restarted"
 
-info "Reading key after recovery..."
-VAL=$(kv_get_pod 0 "failure-key")
-echo "  Got: $VAL"
-echo "$VAL" | grep -q "survives-restart" && pass "Pod-failure recovery: data persisted across restart" \
-    || fail "Pod-failure recovery: data lost after pod restart"
+info "Waiting 30s for anti-entropy to sync missed writes to pod-0..."
+sleep 30
+
+info "Verifying via LocalGet (bypasses quorum — reads pod-0 local storage directly)..."
+for i in 1 2 3; do
+    VAL=$(kubectl exec -n $NS ${STS}-0 -- ./distkv-client -server=localhost:8080 local-get "ae-missed-${i}" 2>&1)
+    echo "  ae-missed-${i}: $VAL"
+    echo "$VAL" | grep -q "missed-value-${i}" \
+        && pass "Anti-entropy: ae-missed-${i} synced to pod-0 local storage" \
+        || fail "Anti-entropy: ae-missed-${i} not on pod-0 (try increasing sleep)"
+done
 
 # ──────────────────────────────────────────────────────────────
 echo ""
@@ -99,4 +111,4 @@ kv_status
 
 echo ""
 echo -e "${GREEN}All validations passed.${NC}"
-echo "Scenarios confirmed: quorum replication, pod-failure recovery, scale-out."
+echo "Scenarios confirmed: quorum replication, pod-failure recovery + anti-entropy sync, scale-out."

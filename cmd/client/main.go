@@ -46,6 +46,7 @@ type DistKVClient struct {
 	conn         *grpc.ClientConn
 	distkvClient proto.DistKVClient
 	adminClient  proto.AdminServiceClient
+	nodeClient   proto.NodeServiceClient
 }
 
 func main() {
@@ -93,6 +94,12 @@ func main() {
 			os.Exit(1)
 		}
 		err = client.BatchPut(args)
+	case "local-get":
+		if len(args) < 1 {
+			fmt.Println("Usage: client local-get <key>")
+			os.Exit(1)
+		}
+		err = client.LocalGet(args[0])
 	case "status":
 		err = client.GetStatus()
 	case "help":
@@ -188,6 +195,7 @@ func NewDistKVClient(config *ClientConfig) (*DistKVClient, error) {
 		conn:         conn,
 		distkvClient: proto.NewDistKVClient(conn),
 		adminClient:  proto.NewAdminServiceClient(conn),
+		nodeClient:   proto.NewNodeServiceClient(conn),
 	}, nil
 }
 
@@ -354,6 +362,27 @@ func (c *DistKVClient) GetStatus() error {
 	return nil
 }
 
+// LocalGet reads a key directly from this node's local storage, bypassing quorum.
+// Used to verify that anti-entropy has synced a key onto this specific node.
+func (c *DistKVClient) LocalGet(key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer cancel()
+
+	resp, err := c.nodeClient.LocalGet(ctx, &proto.LocalGetRequest{Key: key})
+	if err != nil {
+		return fmt.Errorf("local-get failed: %v", err)
+	}
+	if resp.ErrorMessage != "" {
+		return fmt.Errorf("local-get failed: %s", resp.ErrorMessage)
+	}
+	if !resp.Found {
+		fmt.Printf("Key '%s' not found (local)\n", key)
+	} else {
+		fmt.Printf("Key: %s\nValue: %s (local)\n", key, string(resp.Value))
+	}
+	return nil
+}
+
 // Close closes the gRPC connection
 func (c *DistKVClient) Close() error {
 	if c.conn != nil {
@@ -377,6 +406,7 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  put <key> <value>           Store a key-value pair")
 	fmt.Println("  get <key>                   Retrieve value for a key")
+	fmt.Println("  local-get <key>             Read key from this node only (bypasses quorum; use to verify anti-entropy)")
 	fmt.Println("  delete <key>                Delete a key-value pair")
 	fmt.Println("  batch <k1> <v1> <k2> <v2>   Store multiple key-value pairs")
 	fmt.Println("  status                      Show cluster status")
