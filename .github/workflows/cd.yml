@@ -138,3 +138,29 @@ jobs:
       run: |
         kubectl get pods -n distkv
         kubectl get services -n distkv
+
+  validate-k8s:
+    name: Validate Kubernetes Deployment
+    runs-on: ubuntu-latest
+    needs: deploy-k8s
+    if: github.event_name == 'release'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+    - name: Run k8s validation
+      run: |
+        chmod +x scripts/k8s-validate.sh
+        ./scripts/k8s-validate.sh
+      timeout-minutes: 10
