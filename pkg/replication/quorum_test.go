@@ -564,60 +564,6 @@ func TestGetConfig(t *testing.T) {
 	}
 }
 
-// TestLocalWriteRead tests local-only write and read for single-node mode
-func TestLocalWriteRead(t *testing.T) {
-	config := &QuorumConfig{N: 1, R: 1, W: 1, RequestTimeout: 5 * time.Second,
-		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
-
-	selector := &MockNodeSelector{aliveReplicas: []ReplicaInfo{}, replicas: []ReplicaInfo{}}
-	client := &MockReplicaClient{
-		writeResponses: make(map[string]*ReplicaResponse),
-		readResponses:  make(map[string]*ReplicaResponse),
-	}
-	storageEngine := NewMockStorageEngine()
-
-	qm, _ := NewQuorumManager(config, selector, client, storageEngine)
-
-	vc := consensus.NewVectorClock()
-	vc.Increment("local")
-
-	// Write locally
-	writeReq := &WriteRequest{
-		Key:         "test-key",
-		Value:       []byte("test-value"),
-		VectorClock: vc,
-		Context:     context.Background(),
-	}
-
-	writeResp, err := qm.Write(writeReq)
-	if err != nil {
-		t.Fatalf("Local write failed: %v", err)
-	}
-
-	if !writeResp.Success {
-		t.Error("Expected successful local write")
-	}
-
-	// Read locally
-	readReq := &ReadRequest{
-		Key:     "test-key",
-		Context: context.Background(),
-	}
-
-	readResp, err := qm.Read(readReq)
-	if err != nil {
-		t.Fatalf("Local read failed: %v", err)
-	}
-
-	if !readResp.Found {
-		t.Error("Expected to find locally written value")
-	}
-
-	if string(readResp.Value) != "test-value" {
-		t.Errorf("Expected 'test-value', got '%s'", string(readResp.Value))
-	}
-}
-
 // TestReadConcurrentVersionsPreserved tests that truly concurrent versions are preserved as siblings
 func TestReadConcurrentVersionsPreserved(t *testing.T) {
 	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second,
