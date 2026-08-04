@@ -394,16 +394,17 @@ func (s *DistKVServer) Start() error {
 	// Add self to gossip manager with the advertise address
 	s.gossipManager.AddNode(s.config.NodeID, s.config.AdvertiseAddress)
 
+	// Start gRPC server before announcing to the cluster so that peers can
+	// immediately reach us via gossip once we announce ourselves.
+	if err := s.startGRPCServer(); err != nil {
+		logger.WithError(err).Error("Failed to start gRPC server")
+		return fmt.Errorf("failed to start gRPC server: %v", err)
+	}
+
 	// Join cluster by connecting to seed nodes
 	if err := s.joinCluster(); err != nil {
 		logger.WithError(err).Warn("Failed to join cluster, operating as single-node")
 		// Continue anyway - we can operate as a single-node cluster
-	}
-
-	// Start gRPC server
-	if err := s.startGRPCServer(); err != nil {
-		logger.WithError(err).Error("Failed to start gRPC server")
-		return fmt.Errorf("failed to start gRPC server: %v", err)
 	}
 
 	// Start anti-entropy background repair

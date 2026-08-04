@@ -170,12 +170,19 @@ func (ni *NodeInfo) MergeFrom(other *NodeInfo) bool {
 
 	updated := false
 
-	// Update if other info is more recent
-	if other.Version > ni.Version ||
-		(other.Version == ni.Version && other.HeartbeatCounter > ni.HeartbeatCounter) {
+	// Use HeartbeatCounter as the primary ordering mechanism. Version is NOT
+	// transmitted across gossip hops (the proto omits it, so receivers always
+	// reconstruct it as 1), which means Version-first comparisons break after any
+	// local SetStatus/UpdateLastSeen call increments Version above 1.
+	// HeartbeatCounter is the only reliably end-to-end monotone signal.
+	if other.HeartbeatCounter > ni.HeartbeatCounter ||
+		(other.HeartbeatCounter == ni.HeartbeatCounter && other.Version > ni.Version) {
 
 		ni.HeartbeatCounter = other.HeartbeatCounter
-		ni.LastSeen = other.LastSeen
+		// Record when we received this update, not when the remote node generated it.
+		// LastSeen tracks "when did I last get news about this node", so stale
+		// timestamps must not propagate across gossip hops.
+		ni.LastSeen = time.Now().Unix()
 		ni.Status = other.Status
 		ni.Version = other.Version
 		updated = true

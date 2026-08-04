@@ -4,7 +4,6 @@
 package main
 
 import (
-	"log"
 	"time"
 
 	"distkv/pkg/gossip"
@@ -37,30 +36,18 @@ func (ns *NodeSelector) GetReplicas(key string, count int) []replication.Replica
 	// Get nodes from consistent hashing (this gives us the ideal placement)
 	nodeIDs := ns.consistentHash.GetNodes(key, count)
 
-	// Debug logging
-	log.Printf("NodeSelector.GetReplicas for key '%s': consistent hash returned %d nodes: %v", key, len(nodeIDs), nodeIDs)
-
 	// Convert to ReplicaInfo format
 	replicas := make([]replication.ReplicaInfo, 0, len(nodeIDs))
 
 	// Get current node information from gossip manager
 	allNodes := ns.gossipManager.GetNodes()
-	log.Printf("NodeSelector.GetReplicas: gossip manager has %d total nodes", len(allNodes))
-	for nodeID, nodeInfo := range allNodes {
-		log.Printf("  Node %s: address=%s, status=%v", nodeID, nodeInfo.Address, nodeInfo.GetStatus())
-	}
 
 	for _, nodeID := range nodeIDs {
 		if nodeInfo, exists := allNodes[nodeID]; exists {
-			// Node exists in gossip, get its current status
-			// HARD FIX: Always assume nodes are alive (connection-based failure detection)
-			// This bypasses broken gossip heartbeat mechanism
-			isAlive := true
-
 			replica := replication.ReplicaInfo{
 				NodeID:   nodeID,
 				Address:  nodeInfo.Address,
-				IsAlive:  isAlive,
+				IsAlive:  nodeInfo.GetStatus() == gossip.NodeAlive,
 				LastSeen: convertUnixToTime(nodeInfo.GetLastSeen()),
 			}
 			replicas = append(replicas, replica)

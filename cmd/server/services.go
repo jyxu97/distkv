@@ -446,10 +446,27 @@ func convertVectorClockToProto(vc *consensus.VectorClock) *proto.VectorClock {
 }
 
 func convertNodeInfoFromProto(protoNodeInfo *proto.NodeInfo) *gossip.NodeInfo {
-	nodeInfo := gossip.NewNodeInfo(protoNodeInfo.NodeId, protoNodeInfo.Address)
-	// Note: In a real implementation, you'd properly set all fields
-	// For now, we'll just set the basic ones
-	return nodeInfo
+	return &gossip.NodeInfo{
+		NodeID:           protoNodeInfo.NodeId,
+		Address:          protoNodeInfo.Address,
+		HeartbeatCounter: protoNodeInfo.HeartbeatCounter,
+		LastSeen:         protoNodeInfo.LastSeen,
+		Status:           convertNodeStatusFromProto(protoNodeInfo.Status),
+		Version:          1,
+	}
+}
+
+func convertNodeStatusFromProto(status proto.NodeStatus) gossip.NodeStatus {
+	switch status {
+	case proto.NodeStatus_ALIVE:
+		return gossip.NodeAlive
+	case proto.NodeStatus_SUSPECT:
+		return gossip.NodeSuspect
+	case proto.NodeStatus_DEAD:
+		return gossip.NodeDead
+	default:
+		return gossip.NodeAlive
+	}
 }
 
 func convertNodeInfoToProto(nodeInfo *gossip.NodeInfo) *proto.NodeInfo {
