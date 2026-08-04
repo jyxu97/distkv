@@ -382,6 +382,22 @@ func (s *DistKVServer) Start() error {
 		})
 	logger.Info("Starting DistKV server")
 
+	// Keep the hash ring and replica client in sync with gossip membership.
+	// OldStatus == NodeDead is the sentinel meaning "this node was not known before"
+	// (used by both AddNode and ProcessGossipMessage when a node is first discovered).
+	// ConsistentHash.AddNode and replicaClient.UpdateNodeAddress are both idempotent,
+	// so firing this for the local node (which joinCluster also handles) is harmless.
+	s.gossipManager.RegisterEventCallback(func(event gossip.NodeEvent) {
+		if event.OldStatus == gossip.NodeDead && event.NodeID != s.config.NodeID {
+			s.consistentHash.AddNode(event.NodeID)
+			s.replicaClient.UpdateNodeAddress(event.NodeID, event.Address)
+			logger.WithFields(map[string]interface{}{
+				"nodeID":  event.NodeID,
+				"address": event.Address,
+			}).Info("Gossip: new node discovered, added to hash ring")
+		}
+	})
+
 	// Start gossip protocol
 	if err := s.gossipManager.Start(); err != nil {
 		logger.WithError(err).Error("Failed to start gossip manager")

@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 // ConsistentHash represents a consistent hash ring for distributing data across nodes.
@@ -25,6 +26,9 @@ type ConsistentHash struct {
 
 	// nodes: Set of all physical nodes currently in the ring
 	nodes map[string]bool
+
+	// mu protects concurrent access to the ring, sortedKeys, and nodes fields
+	mu sync.RWMutex
 }
 
 // NewConsistentHash creates a new consistent hash ring.
@@ -59,6 +63,9 @@ func (ch *ConsistentHash) hash(key string) uint32 {
 // AddNode adds a physical node to the hash ring.
 // It creates multiple virtual nodes (replicas) to ensure uniform distribution.
 func (ch *ConsistentHash) AddNode(nodeID string) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
 	// Prevent duplicate nodes
 	if ch.nodes[nodeID] {
 		return
@@ -86,6 +93,9 @@ func (ch *ConsistentHash) AddNode(nodeID string) {
 
 // RemoveNode removes a physical node and all its virtual nodes from the ring.
 func (ch *ConsistentHash) RemoveNode(nodeID string) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
 	// Check if node exists
 	if !ch.nodes[nodeID] {
 		return
@@ -113,6 +123,9 @@ func (ch *ConsistentHash) RemoveNode(nodeID string) {
 // GetNode returns the node responsible for storing a given key.
 // It uses consistent hashing to find the first node clockwise from key's hash.
 func (ch *ConsistentHash) GetNode(key string) string {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
 	if len(ch.sortedKeys) == 0 {
 		return "" // No nodes available
 	}
@@ -137,6 +150,9 @@ func (ch *ConsistentHash) GetNode(key string) string {
 // GetNodes returns N nodes responsible for a key (for replication).
 // It finds the first N unique physical nodes clockwise from the key's position.
 func (ch *ConsistentHash) GetNodes(key string, count int) []string {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
 	if len(ch.nodes) == 0 {
 		return nil
 	}
@@ -173,6 +189,9 @@ func (ch *ConsistentHash) GetNodes(key string, count int) []string {
 
 // GetAllNodes returns all nodes currently in the hash ring.
 func (ch *ConsistentHash) GetAllNodes() []string {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
 	nodes := make([]string, 0, len(ch.nodes))
 	for nodeID := range ch.nodes {
 		nodes = append(nodes, nodeID)
@@ -182,17 +201,21 @@ func (ch *ConsistentHash) GetAllNodes() []string {
 
 // Size returns the number of physical nodes in the ring.
 func (ch *ConsistentHash) Size() int {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
 	return len(ch.nodes)
 }
 
 // GetNodeDistribution returns how many virtual nodes each physical node has.
 // Useful for debugging and ensuring balanced distribution.
 func (ch *ConsistentHash) GetNodeDistribution() map[string]int {
-	distribution := make(map[string]int)
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
 
+	distribution := make(map[string]int)
 	for _, nodeID := range ch.ring {
 		distribution[nodeID]++
 	}
-
 	return distribution
 }
