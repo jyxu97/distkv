@@ -349,10 +349,12 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 		defer cancel()
 	}
 
-	// Send read requests to R replicas concurrently
-	responseChan := make(chan *ReplicaResponse, qm.config.R)
+	// Send read requests to all available replicas concurrently; return as soon
+	// as R succeed. This matches Dynamo's approach: we don't know in advance
+	// which replicas will respond, so we fan out to all and take the first R.
+	responseChan := make(chan *ReplicaResponse, len(replicas))
 
-	for i := 0; i < qm.config.R && i < len(replicas); i++ {
+	for _, r := range replicas {
 		go func(r ReplicaInfo) {
 			response, err := qm.client.ReadReplica(ctx, r.NodeID, req.Key)
 			if err != nil {
@@ -364,18 +366,21 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 			} else {
 				responseChan <- response
 			}
-		}(replicas[i])
+		}(r)
 	}
 
-	// Collect responses
+	// Collect until R successes or all replicas have responded.
 	var responses []*ReplicaResponse
 	var errs []error
 
-	for i := 0; i < qm.config.R; i++ {
+	for i := 0; i < len(replicas); i++ {
 		select {
 		case response := <-responseChan:
 			if response.Success {
 				responses = append(responses, response)
+				if len(responses) >= qm.config.R {
+					goto quorumMet
+				}
 			} else {
 				errs = append(errs, fmt.Errorf("node %s: %v", response.NodeID, response.Error))
 			}
@@ -387,6 +392,7 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 			}, ctx.Err()
 		}
 	}
+quorumMet:
 
 	// Check if we got enough responses
 	if len(responses) < qm.config.R {

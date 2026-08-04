@@ -475,6 +475,7 @@ func TestReadConflictResolution(t *testing.T) {
 		readResponses: map[string]*ReplicaResponse{
 			"node1": {NodeID: "node1", Success: true, Value: []byte("old-value"), VectorClock: oldVC},
 			"node2": {NodeID: "node2", Success: true, Value: []byte("new-value"), VectorClock: newVC},
+			"node3": {NodeID: "node3", Success: false, Error: errors.New("node3 unavailable")},
 		},
 	}
 	storageEngine := NewMockStorageEngine()
@@ -589,6 +590,7 @@ func TestReadConcurrentVersionsPreserved(t *testing.T) {
 		readResponses: map[string]*ReplicaResponse{
 			"node1": {NodeID: "node1", Success: true, Value: []byte("value-A"), VectorClock: vc1},
 			"node2": {NodeID: "node2", Success: true, Value: []byte("value-B"), VectorClock: vc2},
+			"node3": {NodeID: "node3", Success: false, Error: errors.New("node3 unavailable")},
 		},
 	}
 	storageEngine := NewMockStorageEngine()
@@ -650,6 +652,7 @@ func TestReadCausalOrderResolved(t *testing.T) {
 		readResponses: map[string]*ReplicaResponse{
 			"node1": {NodeID: "node1", Success: true, Value: []byte("old-value"), VectorClock: oldVC},
 			"node2": {NodeID: "node2", Success: true, Value: []byte("new-value"), VectorClock: newVC},
+			"node3": {NodeID: "node3", Success: false, Error: errors.New("node3 unavailable")},
 		},
 	}
 	storageEngine := NewMockStorageEngine()
