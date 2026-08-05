@@ -223,12 +223,15 @@ func (s *NodeServiceImpl) Replicate(ctx context.Context, req *proto.ReplicateReq
 		}, nil
 	}
 
-	// Update vector clock for this node
-	vectorClock.Increment(s.server.config.NodeID)
+	// Increment a copy for the response so the stored entry is not mutated.
+	// The storage engine holds the vectorClock pointer directly; modifying it
+	// in-place would corrupt the stored vector clock for this key.
+	responseVC := vectorClock.Copy()
+	responseVC.Increment(s.server.config.NodeID)
 
 	return &proto.ReplicateResponse{
 		Success:     true,
-		VectorClock: convertVectorClockToProto(vectorClock),
+		VectorClock: convertVectorClockToProto(responseVC),
 	}, nil
 }
 

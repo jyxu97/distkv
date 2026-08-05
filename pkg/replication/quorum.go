@@ -464,6 +464,12 @@ func (qm *QuorumManager) resolveReadConflicts(responses []*ReplicaResponse, erro
 					// New response dominates existing candidate — drop the candidate
 					continue
 				}
+				if c.resp.VectorClock.Equal(response.VectorClock) {
+					// Same version on multiple replicas — not a conflict, just replication
+					dominated = true
+					newCandidates = append(newCandidates, c)
+					continue
+				}
 			} else if response.VectorClock != nil && c.resp.VectorClock == nil {
 				// New response has a clock, old doesn't — new dominates
 				continue
@@ -473,7 +479,7 @@ func (qm *QuorumManager) resolveReadConflicts(responses []*ReplicaResponse, erro
 				newCandidates = append(newCandidates, c)
 				continue
 			}
-			// Concurrent or both nil — keep both
+			// Genuinely concurrent — keep both as siblings
 			newCandidates = append(newCandidates, c)
 		}
 
