@@ -70,13 +70,13 @@ func OpenWAL(path string, syncOnAppend bool) (*WAL, error) {
 	if path == "" {
 		return nil, fmt.Errorf("wal: path cannot be empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, fmt.Errorf("wal: failed to create directory: %w", err)
 	}
 
 	// O_APPEND guarantees each write lands at the current end of file even if
 	// something else writes concurrently at the OS level.
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(filepath.Clean(path), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to open log file: %w", err)
 	}
@@ -110,6 +110,9 @@ func (w *WAL) Append(entry *Entry) error {
 		return fmt.Errorf("wal: append on closed log")
 	}
 
+	if len(payload) > 1<<32-1 {
+		return fmt.Errorf("wal: record too large (%d bytes)", len(payload))
+	}
 	var header [walRecordHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
@@ -202,14 +205,14 @@ func (w *WAL) Rotate() (string, error) {
 	sealedPath := fmt.Sprintf("%s.%d.sealed", w.path, time.Now().UnixNano())
 	if err := os.Rename(w.path, sealedPath); err != nil {
 		// Best-effort reopen so the WAL remains usable on failure.
-		if f, reopenErr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); reopenErr == nil {
+		if f, reopenErr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600); reopenErr == nil {
 			w.file = f
 			w.writer = bufio.NewWriter(f)
 		}
 		return "", fmt.Errorf("wal: rename during rotate failed: %w", err)
 	}
 
-	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("wal: failed to open fresh log after rotate: %w", err)
 	}
@@ -254,7 +257,7 @@ func (w *WAL) Close() error {
 // Replay opens its own read-only handle and does not require an open WAL, so it
 // can run during engine startup before the writable WAL is opened.
 func ReplayWAL(path string, fn func(*Entry) error) (int, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil // No log yet: nothing to recover.

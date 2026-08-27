@@ -95,8 +95,8 @@ type StorageConfig struct {
 	MaxOpenFiles    int // Max number of SSTable files to keep open
 
 	// Write-ahead log (durability)
-	WALEnabled    bool // Whether to write a durable WAL before each MemTable insert
-	WALSyncOnPut  bool // fsync the WAL on every append (true = crash-safe, slower)
+	WALEnabled   bool // Whether to write a durable WAL before each MemTable insert
+	WALSyncOnPut bool // fsync the WAL on every append (true = crash-safe, slower)
 }
 
 // DefaultStorageConfig returns reasonable default configuration values.
