@@ -3,6 +3,7 @@
 package consensus
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -35,6 +36,34 @@ func NewVectorClockFromMap(clocks map[string]uint64) *VectorClock {
 	return &VectorClock{
 		clocks: clocksCopy,
 	}
+}
+
+// MarshalJSON serializes the vector clock as a JSON object mapping node IDs to
+// their logical clock values, e.g. {"node1":5,"node2":3}.
+//
+// This is required because the clocks map is unexported: without a custom
+// marshaler the default encoding/json output is an empty object ({}), which
+// silently drops all causality information when an Entry is persisted to an
+// SSTable or the write-ahead log. Every on-disk vector clock depends on this.
+func (vc *VectorClock) MarshalJSON() ([]byte, error) {
+	if vc == nil || vc.clocks == nil {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(vc.clocks)
+}
+
+// UnmarshalJSON restores a vector clock from the JSON object produced by
+// MarshalJSON. A null or empty object yields an initialized, empty clock so
+// callers never have to nil-check the internal map.
+func (vc *VectorClock) UnmarshalJSON(data []byte) error {
+	clocks := make(map[string]uint64)
+	if len(data) > 0 && string(data) != "null" {
+		if err := json.Unmarshal(data, &clocks); err != nil {
+			return err
+		}
+	}
+	vc.clocks = clocks
+	return nil
 }
 
 // Increment increases the logical clock for a specific node.
