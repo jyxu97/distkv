@@ -18,7 +18,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.20'
+        go-version: '1.24'
 
     - name: Install dependencies
       run: |
@@ -40,6 +40,9 @@ jobs:
           gofmt -s -l .
           exit 1
         fi
+
+    - name: Build binary
+      run: make build
 
     - name: Run tests
       run: |
@@ -71,14 +74,18 @@ jobs:
     - name: Comment PR
       uses: actions/github-script@v7
       if: always()
+      continue-on-error: true
       with:
         script: |
           const fs = require('fs');
-          const coverage = fs.readFileSync('coverage.out', 'utf8');
-          const lines = coverage.split('\n');
-          const totalLine = lines[lines.length - 2];
-          const match = totalLine.match(/(\d+\.\d+)%/);
-          const coveragePercent = match ? match[1] : 'unknown';
+          let coveragePercent = 'unknown';
+          if (fs.existsSync('coverage.out')) {
+            const coverage = fs.readFileSync('coverage.out', 'utf8');
+            const lines = coverage.split('\n');
+            const totalLine = lines[lines.length - 2];
+            const match = totalLine.match(/(\d+\.\d+)%/);
+            coveragePercent = match ? match[1] : 'unknown';
+          }
 
           github.rest.issues.createComment({
             issue_number: context.issue.number,
@@ -98,7 +105,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.20'
+        go-version: '1.24'
 
     - name: Install dependencies
       run: |

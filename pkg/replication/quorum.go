@@ -465,6 +465,12 @@ func (qm *QuorumManager) resolveReadConflicts(responses []*ReplicaResponse, erro
 					continue
 				}
 				if c.resp.VectorClock.Equal(response.VectorClock) {
+					if response.Value == nil && c.resp.Value != nil {
+						// New response is a tombstone at the same VC — tombstone supersedes
+						// the value (a delete always wins over an equal-version write).
+						// Drop the existing value candidate; response will be added below.
+						continue
+					}
 					// Same version on multiple replicas — not a conflict, just replication
 					dominated = true
 					newCandidates = append(newCandidates, c)

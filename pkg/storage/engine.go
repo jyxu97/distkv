@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -61,6 +62,12 @@ type Engine struct {
 
 	// memoryMonitor tracks and enforces memory limits
 	memoryMonitor *MemoryMonitor
+
+	// wal is the write-ahead log. When enabled, every mutation is appended and
+	// fsync'd here before being inserted into the active MemTable, so an
+	// acknowledged write survives a crash and is replayed on the next startup.
+	// nil when WAL is disabled via config.
+	wal *WAL
 }
 
 // NewEngine creates a new storage engine with the specified configuration.
@@ -130,6 +137,17 @@ func NewEngine(dataDir string, config *StorageConfig) (*Engine, error) {
 			"failed to load existing SSTables").WithContext("dataDir", dataDir)
 	}
 
+	// Recover the write-ahead log, if enabled. Any writes that were
+	// acknowledged but not yet flushed to an SSTable live only in the WAL after
+	// a crash; replaying them into the active MemTable restores durability.
+	if config.WALEnabled {
+		if err := engine.recoverWAL(); err != nil {
+			logger.WithError(err).Error("Failed to recover write-ahead log")
+			return nil, errors.Wrap(err, errors.ErrCodeStorageCorrupted,
+				"failed to recover write-ahead log").WithContext("dataDir", dataDir)
+		}
+	}
+
 	// Start background workers
 	engine.startBackgroundWorkers()
 
@@ -167,6 +185,20 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 
 	// Create entry
 	entry := NewEntry(key, value, vectorClock)
+
+	// Durability: append to the write-ahead log and fsync BEFORE inserting into
+	// the MemTable. If we crash after this returns, the write is recoverable on
+	// restart; if the append fails, we reject the write rather than acknowledge
+	// something we can't recover. This is what makes an ack'd write survive a crash.
+	if e.wal != nil {
+		if err := e.wal.Append(entry); err != nil {
+			e.mutex.Unlock()
+			e.stats.WriteErrors++
+			e.metrics.Storage().WriteErrors.Add(1)
+			e.logger.WithError(err).WithField("key", key).Error("Failed to append to WAL")
+			return errors.Wrap(err, errors.ErrCodeInternal, "failed to append to WAL")
+		}
+	}
 
 	// Estimate memory usage and check limits
 	estimatedSize := int64(len(key) + len(value) + 64) // Rough estimate
@@ -306,6 +338,16 @@ func (e *Engine) Delete(key string, vectorClock *consensus.VectorClock) error {
 	// Create tombstone entry
 	entry := NewDeleteEntry(key, vectorClock)
 
+	// Durability: persist the tombstone to the WAL before inserting it into the
+	// MemTable, so an acknowledged delete survives a crash just like a put.
+	if e.wal != nil {
+		if err := e.wal.Append(entry); err != nil {
+			e.stats.WriteErrors++
+			e.logger.WithError(err).WithField("key", key).Error("Failed to append delete to WAL")
+			return errors.Wrap(err, errors.ErrCodeInternal, "failed to append delete to WAL")
+		}
+	}
+
 	// Add tombstone to active MemTable
 	if err := e.activeMemTable.Put(*entry); err != nil {
 		e.stats.WriteErrors++
@@ -423,9 +465,25 @@ func (e *Engine) Close() error {
 			shutdownErrors = append(shutdownErrors, err)
 		} else {
 			e.logger.Info("Final MemTable flushed successfully")
+			// The remaining data is now durable in an SSTable, so the WAL that
+			// covered it can be discarded. If truncation fails we keep the WAL;
+			// replay on next startup is idempotent (same keys re-inserted).
+			if e.wal != nil {
+				if err := e.wal.Truncate(); err != nil {
+					e.logger.WithError(err).Warn("Failed to truncate WAL after final flush")
+				}
+			}
 		}
 	} else {
 		e.mutex.Unlock()
+	}
+
+	// Close the write-ahead log now that no further writes will occur.
+	if e.wal != nil {
+		if err := e.wal.Close(); err != nil {
+			e.logger.WithError(err).Error("Failed to close WAL")
+			shutdownErrors = append(shutdownErrors, err)
+		}
 	}
 
 	// Close all SSTable files
@@ -459,6 +517,32 @@ func (e *Engine) Close() error {
 
 	e.logger.Info("Storage engine shutdown completed successfully")
 	return nil
+}
+
+// CrashForTesting simulates an abrupt process crash for tests: it stops the
+// background workers and closes the WAL file handle WITHOUT performing the
+// graceful final flush that Close does. Any data still in the active MemTable
+// therefore exists only in the WAL, exactly as it would after a real crash, so
+// a subsequent NewEngine on the same directory must recover it by replaying the
+// WAL. It must only be used in tests.
+func (e *Engine) CrashForTesting() {
+	e.mutex.Lock()
+	if e.closed {
+		e.mutex.Unlock()
+		return
+	}
+	e.closed = true
+	e.mutex.Unlock()
+
+	close(e.stopChan)
+	e.wg.Wait()
+	e.memoryMonitor.Stop()
+
+	// Release the WAL file handle but do NOT truncate it: its records are the
+	// only copy of the unflushed writes and must survive to be replayed.
+	if e.wal != nil {
+		_ = e.wal.Close()
+	}
 }
 
 // triggerFlush signals that a MemTable flush is needed.
@@ -527,6 +611,21 @@ func (e *Engine) performFlush() {
 	memTableCount := len(e.flushingMemTables) + 1
 	e.metrics.Storage().MemTableCount.Store(int64(memTableCount))
 
+	// Seal the current WAL segment atomically with the MemTable swap. Records
+	// for the MemTable we're about to flush are now in the sealed segment;
+	// writes that arrive during the flush go to the fresh active log and are
+	// preserved. We remove the sealed segment only after the SSTable is durable.
+	var sealedWALSegment string
+	if e.wal != nil {
+		var walErr error
+		sealedWALSegment, walErr = e.wal.Rotate()
+		if walErr != nil {
+			e.logger.WithError(walErr).Error("Failed to rotate WAL during flush")
+			// Continue with the flush: correctness of the data is unaffected,
+			// we just won't be able to reclaim the old WAL space this round.
+		}
+	}
+
 	e.mutex.Unlock()
 
 	// Create sstables subdirectory if it doesn't exist
@@ -573,6 +672,17 @@ func (e *Engine) performFlush() {
 	level0Count := len(e.sstables[0])
 	needsCompaction := level0Count >= e.config.CompactionThreshold
 	e.mutex.Unlock()
+
+	// The flushed MemTable is now durable in an SSTable, so the sealed WAL
+	// segment that covered it is no longer needed for recovery and can be
+	// reclaimed. Writes that arrived during the flush are in the fresh active
+	// log and are untouched.
+	if sealedWALSegment != "" {
+		if err := RemoveSegment(sealedWALSegment); err != nil {
+			e.logger.WithError(err).WithField("segment", sealedWALSegment).
+				Warn("Failed to remove sealed WAL segment after flush")
+		}
+	}
 
 	// Update metrics
 	e.metrics.Storage().FlushCount.Add(1)
@@ -958,6 +1068,78 @@ func (e *Engine) cleanupOldSSTables(oldTables interface{}) {
 		"successCount": successCount,
 		"errorCount":   errorCount,
 	}).Info("SSTable cleanup completed")
+}
+
+// walPath returns the path to the engine's write-ahead log file.
+func (e *Engine) walPath() string {
+	return filepath.Join(e.dataDir, walFileName)
+}
+
+// recoverWAL replays any records in the write-ahead log into the active
+// MemTable, then opens the log for appending. It runs during NewEngine, after
+// SSTables are loaded, so replayed entries correctly shadow older on-disk
+// versions. Replaying before opening the writable handle ensures we don't
+// re-append the records we're recovering.
+//
+// Replay tolerates a torn final record (a crash mid-append); see ReplayWAL.
+func (e *Engine) recoverWAL() error {
+	path := e.walPath()
+
+	replayInto := func(p string) (int, error) {
+		return ReplayWAL(p, func(entry *Entry) error {
+			// Insert directly into the active MemTable, bypassing Put so we don't
+			// re-append to the WAL during recovery. Later records for the same key
+			// overwrite earlier ones, matching the original write order.
+			return e.activeMemTable.Put(*entry)
+		})
+	}
+
+	total := 0
+
+	// Replay any sealed segments left behind by a crash that occurred after a
+	// WAL rotation but before the corresponding SSTable was durable. They are
+	// named "<wal>.<nanos>.sealed"; sorting by name orders them oldest-first,
+	// which is the order in which their writes originally happened.
+	sealed, err := filepath.Glob(path + ".*.sealed")
+	if err != nil {
+		return fmt.Errorf("failed to list sealed WAL segments: %w", err)
+	}
+	sort.Strings(sealed)
+	for _, seg := range sealed {
+		n, err := replayInto(seg)
+		if err != nil {
+			return err
+		}
+		total += n
+		// The segment's writes are now back in the MemTable and will be
+		// re-flushed and re-logged, so the stale segment can be removed.
+		if err := RemoveSegment(seg); err != nil {
+			e.logger.WithError(err).WithField("segment", seg).
+				Warn("Failed to remove replayed sealed WAL segment")
+		}
+	}
+
+	// Replay the active log last: its writes are the most recent.
+	n, err := replayInto(path)
+	if err != nil {
+		return err
+	}
+	total += n
+
+	if total > 0 {
+		e.logger.WithField("recoveredRecords", total).
+			Info("Recovered writes from write-ahead log")
+	}
+
+	// Open (or create) the log for subsequent appends. Existing records are
+	// preserved: they still describe the current MemTable contents and must not
+	// be truncated until that MemTable is flushed to an SSTable.
+	wal, err := OpenWAL(path, e.config.WALSyncOnPut)
+	if err != nil {
+		return err
+	}
+	e.wal = wal
+	return nil
 }
 
 // loadExistingSSTables scans the data directory and opens existing SSTables.
