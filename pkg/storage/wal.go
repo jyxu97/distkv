@@ -114,7 +114,7 @@ func (w *WAL) Append(entry *Entry) error {
 		return fmt.Errorf("wal: record too large (%d bytes)", len(payload))
 	}
 	var header [walRecordHeaderSize]byte
-	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(payload))) // #nosec G115 -- bounds-checked above
 	binary.LittleEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload))
 
 	if _, err := w.writer.Write(header[:]); err != nil {
