@@ -93,6 +93,10 @@ type StorageConfig struct {
 	WriteBufferSize int // Size of write-ahead log buffer
 	CacheSize       int // Size of block cache
 	MaxOpenFiles    int // Max number of SSTable files to keep open
+
+	// Write-ahead log (durability)
+	WALEnabled    bool // Whether to write a durable WAL before each MemTable insert
+	WALSyncOnPut  bool // fsync the WAL on every append (true = crash-safe, slower)
 }
 
 // DefaultStorageConfig returns reasonable default configuration values.
@@ -123,6 +127,12 @@ func DefaultStorageConfig() *StorageConfig {
 		WriteBufferSize: 4 * 1024 * 1024,   // 4MB
 		CacheSize:       128 * 1024 * 1024, // 128MB
 		MaxOpenFiles:    1000,
+
+		// Durability: WAL enabled and fsync'd on every write by default, so an
+		// acknowledged write survives a crash. Disable WALSyncOnPut only if you
+		// accept losing the last few writes on a hard crash in exchange for speed.
+		WALEnabled:   true,
+		WALSyncOnPut: true,
 	}
 }
 
