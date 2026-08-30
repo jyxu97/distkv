@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "DistKV Runtime Architecture",
+    "locale": "en",
+    "output": "distkv-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/jyxu97/distkv.git",
+      "revision": "9cd7f4ca555815599c696f12329cceeb8a097060"
+    },
+    "views": [
+      {
+        "id": "request-path",
+        "label": "Quorum request path",
+        "focus": ["client", "grpc-api", "quorum", "replica-rpc", "peer-nodes"],
+        "note": "Follow a client operation from any contacted node to the selected replicas."
+      },
+      {
+        "id": "placement",
+        "label": "Placement and health",
+        "focus": ["membership", "quorum", "replica-rpc", "peer-nodes"],
+        "note": "Gossip supplies liveness and addresses while consistent hashing selects owners."
+      },
+      {
+        "id": "durability",
+        "label": "Local durability",
+        "focus": ["grpc-api", "storage-engine", "wal-memtable", "sstables"],
+        "note": "Internal replica calls enter the local LSM engine, append to the WAL, and flush to SSTables."
+      },
+      {
+        "id": "repair",
+        "label": "Convergence and repair",
+        "focus": ["quorum", "anti-entropy", "replica-rpc", "peer-nodes", "storage-engine"],
+        "note": "Quorum reads repair stale replicas; anti-entropy reconciles peers every 30 seconds."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [48, 88],
+    "cols": 5,
+    "gapX": 60,
+    "gapY": 102,
+    "cellW": 120,
+    "cellH": 72
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "CLI / Applications",
+      "sublabel": "Connect to any DistKV node",
+      "row": 1,
+      "col": 0,
+      "sources": [
+        {"path": "cmd/client/main.go", "line": 167, "label": "gRPC client construction"},
+        {"path": "proto/distkv.proto", "line": 7, "end_line": 13, "label": "client API contract"}
+      ]
+    },
+    {
+      "id": "grpc-api",
+      "type": "backend",
+      "label": "gRPC Services",
+      "sublabel": "DistKV + NodeService + Admin",
+      "tag": "optional TLS",
+      "row": 1,
+      "col": 1,
+      "sources": [
+        {"path": "cmd/server/main.go", "line": 678, "end_line": 721, "label": "service registration"},
+        {"path": "proto/distkv.proto", "line": 7, "end_line": 31, "label": "three service contracts"}
+      ]
+    },
+    {
+      "id": "quorum",
+      "type": "backend",
+      "label": "Quorum Coordinator",
+      "sublabel": "N=3, R=2, W=2 by default",
+      "tag": "vector clocks",
+      "row": 1,
+      "col": 2,
+      "sources": [
+        {"path": "cmd/server/services.go", "line": 27, "end_line": 112, "label": "client request handlers"},
+        {"path": "pkg/replication/quorum.go", "line": 204, "label": "quorum writes"},
+        {"path": "pkg/replication/quorum.go", "line": 316, "label": "quorum reads"}
+      ]
+    },
+    {
+      "id": "replica-rpc",
+      "type": "backend",
+      "label": "Replica RPC Client",
+      "sublabel": "connection pool by node ID",
+      "tag": "parallel fan-out",
+      "row": 1,
+      "col": 3,
+      "sources": [
+        {"path": "cmd/server/replica_client.go", "line": 22, "end_line": 40, "label": "connection pool"},
+        {"path": "cmd/server/replica_client.go", "line": 68, "label": "replica writes"},
+        {"path": "cmd/server/replica_client.go", "line": 117, "label": "replica reads"}
+      ]
+    },
+    {
+      "id": "peer-nodes",
+      "type": "cloud",
+      "label": "Peer DistKV Nodes",
+      "sublabel": "same services and local storage",
+      "tag": "3-node deployment",
+      "row": 1,
+      "col": 4,
+      "sources": [
+        {"path": "docker-compose.yml", "line": 42, "end_line": 83, "label": "node 2 and node 3"},
+        {"path": "deploy/k8s/distkv-cluster.yaml", "line": 86, "end_line": 95, "label": "StatefulSet replicas"},
+        {"path": "proto/distkv.proto", "line": 15, "end_line": 22, "label": "inter-node API"}
+      ]
+    },
+    {
+      "id": "membership",
+      "type": "messagebus",
+      "label": "Placement & Health",
+      "sublabel": "gossip health + consistent hash",
+      "tag": "150 virtual nodes",
+      "row": 0,
+      "col": 2,
+      "sources": [
+        {"path": "cmd/server/node_selector.go", "line": 33, "end_line": 67, "label": "replica selection"},
+        {"path": "pkg/gossip/gossip.go", "line": 249, "label": "membership merge"},
+        {"path": "pkg/partition/consistent_hash.go", "line": 152, "label": "key owners"}
+      ]
+    },
+    {
+      "id": "anti-entropy",
+      "type": "backend",
+      "label": "Repair Workers",
+      "sublabel": "read repair + anti-entropy",
+      "tag": "30 s background sync",
+      "row": 2,
+      "col": 3,
+      "sources": [
+        {"path": "pkg/replication/quorum.go", "line": 422, "end_line": 537, "label": "asynchronous read repair"},
+        {"path": "pkg/replication/anti_entropy.go", "line": 45, "label": "anti-entropy manager"},
+        {"path": "cmd/server/main.go", "line": 341, "end_line": 348, "label": "30-second interval"}
+      ]
+    },
+    {
+      "id": "storage-engine",
+      "type": "database",
+      "label": "Local LSM Engine",
+      "sublabel": "LSM read/write coordination",
+      "row": 2,
+      "col": 2,
+      "sources": [
+        {"path": "pkg/storage/engine.go", "line": 19, "end_line": 74, "label": "engine composition"},
+        {"path": "cmd/server/services.go", "line": 172, "end_line": 217, "label": "local read and replicate"}
+      ]
+    },
+    {
+      "id": "wal-memtable",
+      "type": "database",
+      "label": "WAL + MemTable",
+      "sublabel": "fsync before in-memory write",
+      "tag": "crash recovery",
+      "row": 3,
+      "col": 2,
+      "sources": [
+        {"path": "pkg/storage/engine.go", "line": 67, "end_line": 70, "label": "WAL ownership"},
+        {"path": "pkg/storage/engine.go", "line": 190, "end_line": 215, "label": "write path"},
+        {"path": "pkg/storage/engine.go", "line": 1078, "end_line": 1093, "label": "WAL replay"}
+      ]
+    },
+    {
+      "id": "sstables",
+      "type": "database",
+      "label": "SSTable Levels",
+      "sublabel": "Bloom-filtered immutable files",
+      "tag": "background compaction",
+      "row": 3,
+      "col": 3,
+      "sources": [
+        {"path": "pkg/storage/engine.go", "line": 597, "end_line": 699, "label": "MemTable flush"},
+        {"path": "pkg/storage/engine.go", "line": 704, "end_line": 797, "label": "level compaction"},
+        {"path": "pkg/storage/engine.go", "line": 304, "end_line": 321, "label": "SSTable reads"}
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-to-api",
+      "from": "client",
+      "to": "grpc-api",
+      "label": "gRPC / optional TLS",
+      "variant": "emphasis",
+      "labelAt": [198, 336]
+    },
+    {
+      "id": "api-to-quorum",
+      "from": "grpc-api",
+      "to": "quorum",
+      "label": "Put / Get / Delete",
+      "variant": "emphasis",
+      "labelAt": [378, 250]
+    },
+    {
+      "id": "quorum-to-replica",
+      "from": "quorum",
+      "to": "replica-rpc",
+      "label": "parallel quorum fan-out",
+      "variant": "emphasis",
+      "labelAt": [558, 336]
+    },
+    {
+      "id": "replica-to-peers",
+      "from": "replica-rpc",
+      "to": "peer-nodes",
+      "label": "NodeService gRPC / optional TLS",
+      "variant": "emphasis",
+      "labelAt": [738, 336]
+    },
+    {
+      "id": "membership-to-quorum",
+      "from": "membership",
+      "to": "quorum",
+      "label": "owners + alive status",
+      "labelAt": [468, 162]
+    },
+    {
+      "id": "membership-to-peers",
+      "from": "membership",
+      "to": "peer-nodes",
+      "label": "gossip heartbeats",
+      "variant": "dashed"
+    },
+    {
+      "id": "api-to-storage",
+      "from": "grpc-api",
+      "to": "storage-engine",
+      "label": "LocalGet / Replicate",
+      "labelAt": [378, 379]
+    },
+    {
+      "id": "repair-to-replica",
+      "from": "anti-entropy",
+      "to": "replica-rpc",
+      "label": "repair writes + AntiEntropy RPC",
+      "variant": "dashed"
+    },
+    {
+      "id": "repair-to-storage",
+      "from": "anti-entropy",
+      "to": "storage-engine",
+      "label": "hash + newer values",
+      "variant": "dashed",
+      "labelAt": [558, 510]
+    },
+    {
+      "id": "storage-to-memory",
+      "from": "storage-engine",
+      "to": "wal-memtable",
+      "label": "WAL append, then MemTable",
+      "labelAt": [468, 510]
+    },
+    {
+      "id": "memory-to-sstables",
+      "from": "wal-memtable",
+      "to": "sstables",
+      "label": "flush + level compaction",
+      "labelAt": [558, 684]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Consistency",
+      "items": [
+        "Tunable N/R/W quorum with N=3, R=2, W=2 defaults",
+        "Vector clocks preserve concurrent siblings instead of discarding conflicts",
+        "Quorum reads asynchronously repair causally stale replicas"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Convergence",
+      "items": [
+        "Gossip updates membership, liveness, addresses, and hash-ring ownership",
+        "Anti-entropy exchanges a full local-data hash and applies missing or newer entries",
+        "Scale-out data rebalancing and hinted handoff remain placeholders"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Deployment",
+      "items": [
+        "Docker Compose and Kubernetes run three stateful nodes with persistent volumes",
+        "A client may contact any node; that node becomes the request coordinator",
+        "Monitoring configs exist, but DistKV does not currently expose /metrics"
+      ]
+    }
+  ]
+}
