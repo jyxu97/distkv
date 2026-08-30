@@ -87,9 +87,9 @@ make stop-cluster
 
 ### System Components
 
-[![DistKV runtime architecture](docs/distkv-architecture.svg)](https://qianxjcraig.github.io/distkv/)
+[![DistKV runtime architecture](docs/distkv-architecture.svg)](https://jyxu97.github.io/distkv/)
 
-[Open the interactive architecture diagram](https://qianxjcraig.github.io/distkv/)
+[Open the interactive architecture diagram](https://jyxu97.github.io/distkv/)
 
 ### Key Technologies
 
