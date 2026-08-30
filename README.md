@@ -87,25 +87,9 @@ make stop-cluster
 
 ### System Components
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │     │   Client    │     │   Client    │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       └───────────────────┴───────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │ Coordinator │
-                    │   Nodes     │
-                    └──────┬──────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-   ┌────▼────┐       ┌────▼────┐       ┌────▼────┐
-   │Storage  │       │Storage  │       │Storage  │
-   │Node A   │◄─────►│Node B   │◄─────►│Node C   │
-   └─────────┘       └─────────┘       └─────────┘
-```
+[![DistKV runtime architecture](docs/distkv-architecture.svg)](https://qianxjcraig.github.io/distkv/)
+
+[Open the interactive architecture diagram](https://qianxjcraig.github.io/distkv/)
 
 ### Key Technologies
 
