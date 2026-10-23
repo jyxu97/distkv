@@ -623,7 +623,7 @@ func TestPartitionCausesSiblings(t *testing.T) {
 }
 
 // TestClusterScaleOut tests that a new node can join an existing cluster,
-// receive data via anti-entropy, and participate in quorum operations.
+// receive data via bootstrap streaming, and participate in quorum operations.
 func TestClusterScaleOut(t *testing.T) {
 	cluster := SetupChaosCluster(t, 3)
 	defer cluster.TearDown()
@@ -668,10 +668,10 @@ func TestClusterScaleOut(t *testing.T) {
 	newNode.conn = conn
 	newNode.client = proto.NewDistKVClient(conn)
 
-	// Wait for the new node to join gossip and anti-entropy to propagate data
-	// (anti-entropy runs every 30s; give it one full cycle plus buffer)
-	t.Log("Waiting for new node to sync via anti-entropy (35s)...")
-	time.Sleep(35 * time.Second)
+	// The new node streams its ranges during startup; wait for gossip to spread
+	// that it has finished bootstrapping
+	t.Log("Waiting for new node to finish bootstrap (5s)...")
+	time.Sleep(5 * time.Second)
 
 	// New node should serve quorum reads for pre-existing keys
 	misses := 0

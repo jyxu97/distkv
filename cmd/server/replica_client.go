@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"distkv/pkg/consensus"
+	"distkv/pkg/partition"
 	"distkv/pkg/replication"
 	"distkv/pkg/tls"
 	"distkv/proto"
@@ -191,6 +192,35 @@ func (rc *ReplicaClient) SyncRange(ctx context.Context, nodeID string, localHash
 			Value:       kv.Value,
 			VectorClock: convertVectorClockFromProto(kv.VectorClock),
 			IsDeleted:   kv.IsDeleted,
+		})
+	}
+	return entries, nil
+}
+
+// StreamRange fetches every live entry the peer holds in the given token ranges.
+// A joining node uses it to bootstrap the ranges it is taking over.
+func (rc *ReplicaClient) StreamRange(ctx context.Context, nodeID string, ranges []partition.TokenRange) ([]replication.AntiEntropyEntry, error) {
+	client, err := rc.getNodeServiceClient(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to node %s: %v", nodeID, err)
+	}
+
+	protoRanges := make([]*proto.TokenRange, len(ranges))
+	for i, r := range ranges {
+		protoRanges[i] = &proto.TokenRange{Start: r.Start, End: r.End}
+	}
+
+	resp, err := client.StreamRange(ctx, &proto.StreamRangeRequest{Ranges: protoRanges})
+	if err != nil {
+		return nil, fmt.Errorf("StreamRange RPC to %s failed: %v", nodeID, err)
+	}
+
+	entries := make([]replication.AntiEntropyEntry, 0, len(resp.Entries))
+	for _, kv := range resp.Entries {
+		entries = append(entries, replication.AntiEntropyEntry{
+			Key:         kv.Key,
+			Value:       kv.Value,
+			VectorClock: convertVectorClockFromProto(kv.VectorClock),
 		})
 	}
 	return entries, nil

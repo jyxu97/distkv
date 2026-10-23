@@ -148,6 +148,10 @@ type NodeSelector interface {
 
 	// GetAliveReplicas returns only the alive nodes from GetReplicas
 	GetAliveReplicas(key string, count int) []ReplicaInfo
+
+	// GetPendingReplicas returns alive nodes that are bootstrapping into the
+	// key's replica set. Writes must reach them too; reads must not use them.
+	GetPendingReplicas(key string, count int) []ReplicaInfo
 }
 
 // ReplicaClient interface for communicating with replica nodes.
@@ -201,6 +205,9 @@ func NewQuorumManager(config *QuorumConfig, nodeSelector NodeSelector, client Re
 
 // Write performs a quorum write operation.
 // It writes to W replicas and returns success when enough replicas acknowledge.
+// Bootstrapping (pending) replicas also receive the write, and each one raises
+// the required acks by one, so W of the acks still come from readable replicas
+// (the same rule Cassandra uses for pending ranges).
 func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	tracker := metrics.NewLatencyTracker()
 	defer func() {
@@ -217,17 +224,22 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 
 	// Get replica nodes for this key
 	replicas := qm.nodeSelector.GetAliveReplicas(req.Key, qm.config.N)
+	pending := qm.nodeSelector.GetPendingReplicas(req.Key, qm.config.N)
+	required := qm.config.W + len(pending)
 
 	qm.logger.WithFields(map[string]interface{}{
 		"key":           req.Key,
 		"replicaCount":  len(replicas),
-		"requiredCount": qm.config.W,
+		"pendingCount":  len(pending),
+		"requiredCount": required,
 	}).Debug("Found replicas for write operation")
 
 	if len(replicas) < qm.config.W {
 		return nil, fmt.Errorf("insufficient alive replicas: need %d, have %d",
 			qm.config.W, len(replicas))
 	}
+
+	targets := append(append([]ReplicaInfo{}, replicas...), pending...)
 
 	// Create context with timeout
 	ctx := req.Context
@@ -238,9 +250,9 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	}
 
 	// Send write requests to all available replicas concurrently
-	responseChan := make(chan *ReplicaResponse, len(replicas))
+	responseChan := make(chan *ReplicaResponse, len(targets))
 
-	for _, replica := range replicas {
+	for _, replica := range targets {
 		go func(r ReplicaInfo) {
 			response, err := qm.client.WriteReplica(ctx, r.NodeID, req.Key, req.Value, req.VectorClock)
 			if err != nil {
@@ -260,7 +272,7 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	var errs []error
 	var latestVectorClock *consensus.VectorClock
 
-	for i := 0; i < len(replicas) && successfulWrites < qm.config.W; i++ {
+	for i := 0; i < len(targets) && successfulWrites < required; i++ {
 		select {
 		case response := <-responseChan:
 			if response.Success {
@@ -283,12 +295,12 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	}
 
 	// Return success if we got enough acknowledgments
-	if successfulWrites >= qm.config.W {
+	if successfulWrites >= required {
 		qm.metrics.Replication().QuorumWriteSuccess.Add(1)
 		qm.logger.WithFields(map[string]interface{}{
 			"key":              req.Key,
 			"successfulWrites": successfulWrites,
-			"required":         qm.config.W,
+			"required":         required,
 		}).Debug("Quorum write succeeded")
 		return &WriteResponse{
 			Success:         true,
@@ -302,13 +314,13 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	qm.logger.WithFields(map[string]interface{}{
 		"key":              req.Key,
 		"successfulWrites": successfulWrites,
-		"required":         qm.config.W,
+		"required":         required,
 	}).Warn("Quorum write failed")
 	return &WriteResponse{
 		Success:         false,
 		ReplicasWritten: successfulWrites,
 		Errors:          errs,
-	}, errors.NewQuorumFailedError(qm.config.W, successfulWrites)
+	}, errors.NewQuorumFailedError(required, successfulWrites)
 }
 
 // Read performs a quorum read operation.

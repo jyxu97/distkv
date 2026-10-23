@@ -17,6 +17,7 @@ service NodeService {
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
   rpc LocalGet(LocalGetRequest) returns (LocalGetResponse);
   rpc AntiEntropy(AntiEntropyRequest) returns (AntiEntropyResponse);
+  rpc StreamRange(StreamRangeRequest) returns (StreamRangeResponse);
   rpc Gossip(GossipMessage) returns (GossipResponse);
   rpc Handoff(HandoffRequest) returns (HandoffResponse);
 }
@@ -146,6 +147,22 @@ message KeyValue {
   bool is_deleted = 4;
 }
 
+// Bootstrap streaming messages
+// A token range covers ring hashes in (start, end], wrapping past zero when
+// start >= end. start == end means the whole ring.
+message TokenRange {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+message StreamRangeRequest {
+  repeated TokenRange ranges = 1;
+}
+
+message StreamRangeResponse {
+  repeated KeyValue entries = 1;
+}
+
 // Gossip protocol messages
 message NodeInfo {
   string node_id = 1;
@@ -153,6 +170,7 @@ message NodeInfo {
   uint64 heartbeat_counter = 3;
   int64 last_seen = 4;
   NodeStatus status = 5;
+  bool joining = 6;                   // Bootstrapping: receives writes but serves no reads
 }
 
 enum NodeStatus {
@@ -194,6 +212,7 @@ message AddNodeRequest {
   string node_id = 1;
   string node_address = 2;
   int32 virtual_nodes = 3;
+  bool joining = 4;  // Node is bootstrapping and must not serve reads yet
 }
 
 message AddNodeResponse {

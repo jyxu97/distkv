@@ -31,16 +31,46 @@ func NewNodeSelector(consistentHash *partition.ConsistentHash, gossipManager *go
 }
 
 // GetReplicas returns N nodes that should store replicas of the key
-// Uses consistent hashing to determine the nodes, regardless of their current status
+// Uses consistent hashing to determine the nodes, regardless of their current status.
+// Joining nodes are skipped as if they were not on the ring yet, so these are the
+// replicas that already hold the key's data and can serve reads.
 func (ns *NodeSelector) GetReplicas(key string, count int) []replication.ReplicaInfo {
-	// Get nodes from consistent hashing (this gives us the ideal placement)
-	nodeIDs := ns.consistentHash.GetNodes(key, count)
-
-	// Convert to ReplicaInfo format
-	replicas := make([]replication.ReplicaInfo, 0, len(nodeIDs))
-
-	// Get current node information from gossip manager
 	allNodes := ns.gossipManager.GetNodes()
+	isJoining := func(nodeID string) bool {
+		nodeInfo, exists := allNodes[nodeID]
+		return exists && nodeInfo.IsJoining()
+	}
+
+	// Get nodes from consistent hashing (this gives us the ideal placement)
+	nodeIDs := ns.consistentHash.GetNodesExcluding(key, count, isJoining)
+	return ns.toReplicaInfos(nodeIDs, allNodes)
+}
+
+// GetPendingReplicas returns the alive joining nodes that will become replicas
+// of the key once they finish bootstrapping. They receive writes so they do not
+// miss updates made while they stream data, but are never read from.
+func (ns *NodeSelector) GetPendingReplicas(key string, count int) []replication.ReplicaInfo {
+	allNodes := ns.gossipManager.GetNodes()
+
+	var pendingIDs []string
+	for _, nodeID := range ns.consistentHash.GetNodes(key, count) {
+		if nodeInfo, exists := allNodes[nodeID]; exists && nodeInfo.IsJoining() {
+			pendingIDs = append(pendingIDs, nodeID)
+		}
+	}
+
+	pending := make([]replication.ReplicaInfo, 0, len(pendingIDs))
+	for _, replica := range ns.toReplicaInfos(pendingIDs, allNodes) {
+		if replica.IsAlive {
+			pending = append(pending, replica)
+		}
+	}
+	return pending
+}
+
+// toReplicaInfos converts node IDs to ReplicaInfo using the gossip view.
+func (ns *NodeSelector) toReplicaInfos(nodeIDs []string, allNodes map[string]*gossip.NodeInfo) []replication.ReplicaInfo {
+	replicas := make([]replication.ReplicaInfo, 0, len(nodeIDs))
 
 	for _, nodeID := range nodeIDs {
 		if nodeInfo, exists := allNodes[nodeID]; exists {

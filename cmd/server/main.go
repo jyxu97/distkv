@@ -398,6 +398,14 @@ func (s *DistKVServer) Start() error {
 		}
 	})
 
+	// A node joining an existing cluster must not serve reads for its new key
+	// ranges until it has streamed their data. Mark it joining before gossip
+	// starts so peers never see it as readable.
+	joining := len(s.config.SeedNodes) > 0
+	if joining {
+		s.gossipManager.SetLocalJoining(true)
+	}
+
 	// Start gossip protocol
 	if err := s.gossipManager.Start(); err != nil {
 		logger.WithError(err).Error("Failed to start gossip manager")
@@ -421,6 +429,10 @@ func (s *DistKVServer) Start() error {
 	if err := s.joinCluster(); err != nil {
 		logger.WithError(err).Warn("Failed to join cluster, operating as single-node")
 		// Continue anyway - we can operate as a single-node cluster
+	}
+
+	if joining {
+		s.bootstrap()
 	}
 
 	// Start anti-entropy background repair
@@ -558,17 +570,80 @@ func (s *DistKVServer) joinCluster() error {
 	// Also add self to replica client for local operations
 	s.replicaClient.UpdateNodeAddress(s.config.NodeID, s.config.AdvertiseAddress)
 
-	// Announce ourselves to the cluster
-	for _, seedAddress := range s.config.SeedNodes {
-		if err := s.announceSelfToNode(seedAddress); err != nil {
-			logger.WithError(err).WithField("seedAddress", seedAddress).
-				Warn("Failed to announce to seed node")
+	// Announce ourselves to every known node, not just the seeds. Each peer adds
+	// us to its ring before replying, so once this loop finishes their writes
+	// already include us and we can safely snapshot their data in bootstrap.
+	announceTargets := append([]string{}, s.config.SeedNodes...)
+	for _, nodeInfo := range discoveredNodes {
+		parts := strings.Split(nodeInfo, "@")
+		if len(parts) == 2 && parts[0] != s.config.NodeID {
+			announceTargets = append(announceTargets, parts[1])
+		}
+	}
+	announced := make(map[string]bool)
+	for _, address := range announceTargets {
+		if announced[address] {
+			continue
+		}
+		announced[address] = true
+		if err := s.announceSelfToNode(address); err != nil {
+			logger.WithError(err).WithField("address", address).
+				Warn("Failed to announce to node")
 		}
 	}
 
 	logger.WithField("nodeCount", len(discoveredNodes)+1).
 		Info("Successfully joined cluster")
 	return nil
+}
+
+// bootstrap streams the token ranges this node now owns from its peers, then
+// clears the joining flag so the node starts serving reads. While it runs,
+// peers already send us writes for these ranges (as a pending replica), so
+// nothing written during the stream is lost.
+func (s *DistKVServer) bootstrap() {
+	logger := logging.WithComponent("server.bootstrap")
+	defer s.gossipManager.SetLocalJoining(false)
+
+	ranges := s.consistentHash.TokenRangesFor(s.config.NodeID, s.config.QuorumConfig.N)
+	if len(ranges) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Pull from every readable peer rather than only the previous owners: each
+	// filters by our ranges, and merging by vector clock keeps the newest
+	// version even if one replica is stale.
+	var streamed, failedPeers int
+	for _, peer := range s.gossipManager.GetAliveNodes() {
+		if peer.NodeID == s.config.NodeID || peer.Joining {
+			continue
+		}
+
+		entries, err := s.replicaClient.StreamRange(ctx, peer.NodeID, ranges)
+		if err != nil {
+			failedPeers++
+			logger.WithError(err).WithField("peer", peer.NodeID).
+				Warn("Bootstrap: failed to stream from peer; anti-entropy will catch up")
+			continue
+		}
+
+		for _, entry := range entries {
+			if err := replication.MergeEntry(s.storageEngine, entry); err != nil {
+				logger.WithError(err).WithField("key", entry.Key).
+					Warn("Bootstrap: failed to apply entry")
+			}
+		}
+		streamed += len(entries)
+	}
+
+	logger.WithFields(map[string]interface{}{
+		"ranges":      len(ranges),
+		"entries":     streamed,
+		"failedPeers": failedPeers,
+	}).Info("Bootstrap complete, serving reads")
 }
 
 // contactSeedNode contacts a seed node to get current cluster membership
@@ -662,6 +737,7 @@ func (s *DistKVServer) announceSelfToNode(targetAddress string) error {
 		NodeId:       s.config.NodeID,
 		NodeAddress:  s.config.AdvertiseAddress,
 		VirtualNodes: int32(s.config.VirtualNodes),
+		Joining:      s.gossipManager.GetLocalNode().IsJoining(),
 	}
 
 	_, err = adminClient.AddNode(ctx, req)

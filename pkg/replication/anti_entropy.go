@@ -141,20 +141,23 @@ func (am *AntiEntropyManager) syncWithPeer(ctx context.Context, peer PeerInfo, l
 	}).Info("Anti-entropy: applying divergent entries")
 
 	for _, entry := range diffEntries {
-		existing, _ := am.storageEngine.Get(entry.Key)
-		if existing == nil {
-			// We're missing this key entirely
-			if err := am.storageEngine.Put(entry.Key, entry.Value, entry.VectorClock); err != nil {
-				am.logger.WithError(err).WithField("key", entry.Key).Warn("Anti-entropy: failed to apply missing key")
-			}
-		} else if entry.VectorClock != nil && existing.VectorClock != nil && entry.VectorClock.IsAfter(existing.VectorClock) {
-			// Peer has a causally newer version
-			if err := am.storageEngine.Put(entry.Key, entry.Value, entry.VectorClock); err != nil {
-				am.logger.WithError(err).WithField("key", entry.Key).Warn("Anti-entropy: failed to apply newer version")
-			}
+		if err := MergeEntry(am.storageEngine, entry); err != nil {
+			am.logger.WithError(err).WithField("key", entry.Key).Warn("Anti-entropy: failed to apply entry")
 		}
-		// If concurrent (siblings), skip — read repair and application merge handle that
 	}
+}
+
+// MergeEntry applies an entry received from a peer if the key is missing
+// locally or the entry is causally newer. Concurrent versions (siblings) are
+// skipped — read repair and application merge handle those.
+func MergeEntry(storageEngine StorageEngine, entry AntiEntropyEntry) error {
+	existing, _ := storageEngine.Get(entry.Key)
+	if existing != nil {
+		if entry.VectorClock == nil || existing.VectorClock == nil || !entry.VectorClock.IsAfter(existing.VectorClock) {
+			return nil
+		}
+	}
+	return storageEngine.Put(entry.Key, entry.Value, entry.VectorClock)
 }
 
 // buildHash computes a SHA-256 over all non-deleted local entries.

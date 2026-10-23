@@ -477,3 +477,93 @@ func TestGetNodesOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestGetNodesExcluding tests that excluded nodes are skipped as if absent
+func TestGetNodesExcluding(t *testing.T) {
+	full := NewConsistentHash(50)
+	without := NewConsistentHash(50)
+	for _, node := range []string{"node1", "node2", "node3", "node4"} {
+		full.AddNode(node)
+		if node != "node4" {
+			without.AddNode(node)
+		}
+	}
+
+	exclude := func(nodeID string) bool { return nodeID == "node4" }
+	for i := 0; i < 500; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		got := full.GetNodesExcluding(key, 3, exclude)
+		want := without.GetNodes(key, 3)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("key %s: GetNodesExcluding = %v, want %v", key, got, want)
+		}
+	}
+}
+
+// TestTokenRangesFor tests that a key falls in a node's ranges exactly when
+// the node is one of the key's replicas
+func TestTokenRangesFor(t *testing.T) {
+	ch := NewConsistentHash(50)
+	nodes := []string{"node1", "node2", "node3", "node4"}
+	for _, node := range nodes {
+		ch.AddNode(node)
+	}
+
+	for _, node := range nodes {
+		ranges := ch.TokenRangesFor(node, 3)
+		for i := 0; i < 2000; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			h := ch.HashKey(key)
+
+			inRange := false
+			for _, r := range ranges {
+				if r.Contains(h) {
+					inRange = true
+					break
+				}
+			}
+			isReplica := false
+			for _, id := range ch.GetNodes(key, 3) {
+				if id == node {
+					isReplica = true
+					break
+				}
+			}
+
+			if inRange != isReplica {
+				t.Fatalf("node %s key %s: inRange=%v, isReplica=%v", node, key, inRange, isReplica)
+			}
+		}
+	}
+}
+
+// TestTokenRangesForWholeRing tests that a node replicating every key gets a
+// single whole-ring range
+func TestTokenRangesForWholeRing(t *testing.T) {
+	ch := NewConsistentHash(50)
+	ch.AddNode("node1")
+	ch.AddNode("node2")
+
+	ranges := ch.TokenRangesFor("node1", 3)
+	if len(ranges) != 1 || ranges[0].Start != ranges[0].End {
+		t.Fatalf("Expected one whole-ring range, got %v", ranges)
+	}
+	if ch.TokenRangesFor("unknown", 3) != nil {
+		t.Error("Expected no ranges for a node not on the ring")
+	}
+}
+
+// TestTokenRangeContainsWrap tests the wrap-around range semantics
+func TestTokenRangeContainsWrap(t *testing.T) {
+	r := TokenRange{Start: 100, End: 10}
+	for _, h := range []uint32{101, 1 << 31, 0, 10} {
+		if !r.Contains(h) {
+			t.Errorf("Expected wrapped range to contain %d", h)
+		}
+	}
+	for _, h := range []uint32{11, 50, 100} {
+		if r.Contains(h) {
+			t.Errorf("Expected wrapped range not to contain %d", h)
+		}
+	}
+}

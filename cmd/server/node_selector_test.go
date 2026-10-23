@@ -2,6 +2,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -218,4 +219,62 @@ func TestGetReplicasReturnsReplicaInfo(t *testing.T) {
 
 	// Type assertion to ensure it's ReplicaInfo
 	var _ replication.ReplicaInfo = replica
+}
+
+// TestJoiningNodeIsPendingNotReadable tests that a joining node is skipped for
+// reads but returned as a pending replica for writes
+func TestJoiningNodeIsPendingNotReadable(t *testing.T) {
+	ch := partition.NewConsistentHash(50)
+	gm := gossip.NewGossip("coordinator", "localhost:9999", nil)
+	for i, node := range []string{"node1", "node2", "node3"} {
+		ch.AddNode(node)
+		gm.AddNode(node, fmt.Sprintf("localhost:%d", 8080+i))
+	}
+	ch.AddNode("node4")
+	gm.AddJoiningNode("node4", "localhost:8083")
+
+	ns := NewNodeSelector(ch, gm)
+
+	pendingKeys := 0
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("key-%d", i)
+
+		replicas := ns.GetReplicas(key, 3)
+		if len(replicas) != 3 {
+			t.Fatalf("key %s: expected 3 readable replicas, got %d", key, len(replicas))
+		}
+		for _, r := range replicas {
+			if r.NodeID == "node4" {
+				t.Fatalf("key %s: joining node returned as readable replica", key)
+			}
+		}
+
+		pending := ns.GetPendingReplicas(key, 3)
+		inRing := false
+		for _, id := range ch.GetNodes(key, 3) {
+			inRing = inRing || id == "node4"
+		}
+		if inRing != (len(pending) == 1 && pending[0].NodeID == "node4") {
+			t.Fatalf("key %s: pending=%v but node4 in preference list=%v", key, pending, inRing)
+		}
+		if inRing {
+			pendingKeys++
+		}
+	}
+	if pendingKeys == 0 {
+		t.Fatal("Expected node4 to be pending for some keys")
+	}
+
+	// Once node4 finishes bootstrapping it becomes readable and is no longer pending
+	nodes := gm.GetNodes()
+	update := nodes["node4"]
+	update.HeartbeatCounter++
+	update.Joining = false
+	gm.ProcessGossipMessage("node4", []*gossip.NodeInfo{update})
+
+	for i := 0; i < 200; i++ {
+		if len(ns.GetPendingReplicas(fmt.Sprintf("key-%d", i), 3)) != 0 {
+			t.Fatal("Expected no pending replicas after node4 finished joining")
+		}
+	}
 }

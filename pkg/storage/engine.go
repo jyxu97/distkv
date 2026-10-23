@@ -51,6 +51,10 @@ type Engine struct {
 	// stats tracks performance metrics
 	stats *StorageStats
 
+	// statsMu guards stats updates made while holding only mutex.RLock
+	// (concurrent Get and Stats calls); writers holding mutex.Lock are exclusive
+	statsMu sync.Mutex
+
 	// closed indicates if the engine is shut down
 	closed bool
 
@@ -275,10 +279,12 @@ func (e *Engine) Get(key string) (*Entry, error) {
 
 	startTime := time.Now()
 	defer func() {
+		e.statsMu.Lock()
 		e.stats.ReadCount++
-		e.metrics.Storage().ReadOps.Add(1)
 		// Update average read latency (simplified)
 		e.stats.AvgReadLatency = time.Since(startTime)
+		e.statsMu.Unlock()
+		e.metrics.Storage().ReadOps.Add(1)
 	}()
 
 	// First check active MemTable
@@ -313,7 +319,9 @@ func (e *Engine) Get(key string) (*Entry, error) {
 				return entry, nil
 			}
 			if err != ErrKeyNotFound {
+				e.statsMu.Lock()
 				e.stats.ReadErrors++
+				e.statsMu.Unlock()
 				e.metrics.Storage().ReadErrors.Add(1)
 				e.logger.WithError(err).WithField("key", key).
 					Error("Error reading from SSTable")
@@ -375,6 +383,8 @@ func (e *Engine) Iterator() (Iterator, error) {
 func (e *Engine) Stats() *StorageStats {
 	e.mutex.RLock()
 	defer e.mutex.RUnlock()
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
 
 	// Update current stats
 	e.stats.MemTableSize = e.activeMemTable.Size()

@@ -13,6 +13,7 @@ import (
 
 	"distkv/pkg/consensus"
 	"distkv/pkg/gossip"
+	"distkv/pkg/partition"
 	"distkv/pkg/replication"
 	"distkv/pkg/storage"
 	"distkv/proto"
@@ -274,6 +275,44 @@ func (s *NodeServiceImpl) AntiEntropy(ctx context.Context, req *proto.AntiEntrop
 	return &proto.AntiEntropyResponse{MissingKeys: entries}, nil
 }
 
+// StreamRange returns every live entry whose ring hash falls in one of the
+// requested token ranges. A joining node calls this on each peer to bootstrap
+// the ranges it is taking over. Tombstones are skipped, as in AntiEntropy.
+func (s *NodeServiceImpl) StreamRange(ctx context.Context, req *proto.StreamRangeRequest) (*proto.StreamRangeResponse, error) {
+	ranges := make([]partition.TokenRange, len(req.Ranges))
+	for i, r := range req.Ranges {
+		ranges[i] = partition.TokenRange{Start: r.Start, End: r.End}
+	}
+
+	iter, err := s.server.storageEngine.Iterator()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open storage iterator: %v", err)
+	}
+	defer iter.Close()
+
+	var entries []*proto.KeyValue
+	for ; iter.Valid(); iter.Next() {
+		entry := iter.Value()
+		if entry == nil || entry.Deleted {
+			continue
+		}
+
+		h := s.server.consistentHash.HashKey(entry.Key)
+		for _, r := range ranges {
+			if r.Contains(h) {
+				entries = append(entries, &proto.KeyValue{
+					Key:         entry.Key,
+					Value:       entry.Value,
+					VectorClock: convertVectorClockToProto(entry.VectorClock),
+				})
+				break
+			}
+		}
+	}
+
+	return &proto.StreamRangeResponse{Entries: entries}, nil
+}
+
 // Gossip handles gossip protocol messages
 func (s *NodeServiceImpl) Gossip(ctx context.Context, req *proto.GossipMessage) (*proto.GossipResponse, error) {
 	// Convert proto node info to internal format
@@ -318,14 +357,20 @@ func (s *AdminServiceImpl) AddNode(ctx context.Context, req *proto.AddNodeReques
 	// Use the node ID provided by the joining node
 	nodeID := req.NodeId
 
-	// Add to gossip manager
-	s.server.gossipManager.AddNode(nodeID, req.NodeAddress)
-
-	// Add to consistent hash ring
-	s.server.consistentHash.AddNode(nodeID)
+	// Add to gossip manager. A bootstrapping node is registered as joining
+	// before it enters the ring, so it never serves reads for its new ranges.
+	if req.Joining {
+		s.server.gossipManager.AddJoiningNode(nodeID, req.NodeAddress)
+	} else {
+		s.server.gossipManager.AddNode(nodeID, req.NodeAddress)
+	}
 
 	// Update replica client with new node address
 	s.server.replicaClient.UpdateNodeAddress(nodeID, req.NodeAddress)
+
+	// Add to consistent hash ring. This happens before we reply, so once the
+	// joining node's announce returns, our writes already include it.
+	s.server.consistentHash.AddNode(nodeID)
 
 	log.Printf("Added node %s at %s to cluster", nodeID, req.NodeAddress)
 
@@ -455,6 +500,7 @@ func convertNodeInfoFromProto(protoNodeInfo *proto.NodeInfo) *gossip.NodeInfo {
 		HeartbeatCounter: protoNodeInfo.HeartbeatCounter,
 		LastSeen:         protoNodeInfo.LastSeen,
 		Status:           convertNodeStatusFromProto(protoNodeInfo.Status),
+		Joining:          protoNodeInfo.Joining,
 		Version:          1,
 	}
 }
@@ -479,6 +525,7 @@ func convertNodeInfoToProto(nodeInfo *gossip.NodeInfo) *proto.NodeInfo {
 		HeartbeatCounter: nodeInfo.GetHeartbeatCounter(),
 		LastSeen:         nodeInfo.GetLastSeen(),
 		Status:           convertNodeStatusToProto(nodeInfo.GetStatus()),
+		Joining:          nodeInfo.IsJoining(),
 	}
 }
 

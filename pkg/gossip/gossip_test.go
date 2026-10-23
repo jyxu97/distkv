@@ -390,3 +390,25 @@ func TestNodeInfoCopy(t *testing.T) {
 		t.Error("Modifying returned nodes should not affect internal state")
 	}
 }
+
+// TestJoiningFlagPropagation tests that the joining flag travels with gossip
+// updates and that clearing it locally reaches peers with the next heartbeat
+func TestJoiningFlagPropagation(t *testing.T) {
+	joiner := NewGossip("joiner", "localhost:8083", nil)
+	joiner.SetLocalJoining(true)
+
+	peer := NewGossip("peer", "localhost:8080", nil)
+	peer.AddJoiningNode("joiner", "localhost:8083")
+	if !peer.GetNodes()["joiner"].IsJoining() {
+		t.Fatal("Expected node added via AddJoiningNode to be joining")
+	}
+
+	// Joiner finishes bootstrapping; its next heartbeat carries the cleared flag
+	joiner.SetLocalJoining(false)
+	joiner.updateLocalHeartbeat()
+	peer.ProcessGossipMessage("joiner", []*NodeInfo{joiner.GetLocalNode()})
+
+	if peer.GetNodes()["joiner"].IsJoining() {
+		t.Error("Expected peer to see joiner as no longer joining")
+	}
+}

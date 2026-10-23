@@ -98,7 +98,7 @@ make stop-cluster
 - **Replication**: Quorum-based consensus (default: N=3, R=2, W=2)
 - **Conflict Resolution**: Vector clocks with Dynamo-style sibling preservation
 - **Read Repair**: Coordinator detects stale replicas during quorum reads and pushes updates asynchronously
-- **Scale-Out**: New nodes register via seed, gossip propagates membership to all peers, and anti-entropy syncs data within one cycle; ring-based data rebalancing is not implemented
+- **Scale-Out**: A joining node is flagged `joining` in gossip and bootstraps before serving reads: peers send it writes for its new token ranges as a pending replica (required acks become W + pending), while it streams those ranges from every peer. Previous owners keep their copies (no cleanup after hand-off)
 - **Anti-Entropy**: 30-second background sync; nodes exchange a hash of all local entries and apply missing or causally newer keys
 - **Failure Detection**: Gossip protocol with heartbeat monitoring
 - **Communication**: gRPC with Protocol Buffers
@@ -186,7 +186,7 @@ Covers: basic put/get/delete, consistency levels (ONE/QUORUM/ALL), node failure,
 make chaos-test
 ```
 
-Covers: network partition and recovery, sibling preservation under partition, cluster scale-out (3→4 nodes: hash-ring convergence within one gossip interval, data sync via anti-entropy).
+Covers: network partition and recovery, sibling preservation under partition, cluster scale-out (3→4 nodes: hash-ring convergence within one gossip interval, data streamed to the new node during bootstrap).
 
 ### Benchmark
 

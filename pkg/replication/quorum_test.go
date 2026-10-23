@@ -12,8 +12,9 @@ import (
 
 // MockNodeSelector implements NodeSelector for testing
 type MockNodeSelector struct {
-	replicas      []ReplicaInfo
-	aliveReplicas []ReplicaInfo
+	replicas        []ReplicaInfo
+	aliveReplicas   []ReplicaInfo
+	pendingReplicas []ReplicaInfo
 }
 
 func (m *MockNodeSelector) GetReplicas(key string, count int) []ReplicaInfo {
@@ -28,6 +29,10 @@ func (m *MockNodeSelector) GetAliveReplicas(key string, count int) []ReplicaInfo
 		return m.aliveReplicas
 	}
 	return m.aliveReplicas[:count]
+}
+
+func (m *MockNodeSelector) GetPendingReplicas(key string, count int) []ReplicaInfo {
+	return m.pendingReplicas
 }
 
 // MockReplicaClient implements ReplicaClient for testing
@@ -731,5 +736,85 @@ func TestReadRepairTriggeredForStaleReplica(t *testing.T) {
 
 	if len(repaired) != 1 || repaired[0] != "node1" {
 		t.Errorf("Expected read repair write to node1, got: %v", repaired)
+	}
+}
+
+// TestWriteIncludesPendingReplicas verifies that a bootstrapping (pending)
+// replica receives the write and raises the required acks by one.
+func TestWriteIncludesPendingReplicas(t *testing.T) {
+	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second,
+		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
+
+	replicas := []ReplicaInfo{
+		{NodeID: "node1", Address: "addr1", IsAlive: true},
+		{NodeID: "node2", Address: "addr2", IsAlive: true},
+		{NodeID: "node3", Address: "addr3", IsAlive: true},
+	}
+	pending := []ReplicaInfo{{NodeID: "node4", Address: "addr4", IsAlive: true}}
+
+	selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas, pendingReplicas: pending}
+	client := &MockReplicaClient{
+		writeResponses: make(map[string]*ReplicaResponse),
+		readResponses:  make(map[string]*ReplicaResponse),
+	}
+	qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+	vc := consensus.NewVectorClock()
+	vc.Increment("node1")
+	resp, err := qm.Write(&WriteRequest{Key: "k", Value: []byte("v"), VectorClock: vc, Context: context.Background()})
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if resp.ReplicasWritten != 3 {
+		t.Errorf("Expected W+pending = 3 acks, got %d", resp.ReplicasWritten)
+	}
+
+	// Wait for the remaining in-flight write so the call log is complete
+	time.Sleep(50 * time.Millisecond)
+	client.repairCallsMu.Lock()
+	defer client.repairCallsMu.Unlock()
+	found := false
+	for _, nodeID := range client.repairCallNodes {
+		if nodeID == "node4" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("Expected pending replica node4 to receive the write")
+	}
+}
+
+// TestWritePendingAckDoesNotReplaceNaturalAck verifies that one natural ack
+// plus one pending ack does not satisfy W=2: readers would only see one copy.
+func TestWritePendingAckDoesNotReplaceNaturalAck(t *testing.T) {
+	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second,
+		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
+
+	replicas := []ReplicaInfo{
+		{NodeID: "node1", Address: "addr1", IsAlive: true},
+		{NodeID: "node2", Address: "addr2", IsAlive: true},
+		{NodeID: "node3", Address: "addr3", IsAlive: true},
+	}
+	pending := []ReplicaInfo{{NodeID: "node4", Address: "addr4", IsAlive: true}}
+
+	failure := errors.New("unreachable")
+	selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas, pendingReplicas: pending}
+	client := &MockReplicaClient{
+		writeResponses: map[string]*ReplicaResponse{
+			"node2": {NodeID: "node2", Success: false, Error: failure},
+			"node3": {NodeID: "node3", Success: false, Error: failure},
+		},
+		readResponses: make(map[string]*ReplicaResponse),
+	}
+	qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+	vc := consensus.NewVectorClock()
+	vc.Increment("node1")
+	resp, err := qm.Write(&WriteRequest{Key: "k", Value: []byte("v"), VectorClock: vc, Context: context.Background()})
+	if err == nil {
+		t.Fatal("Expected write to fail with only one natural replica acknowledging")
+	}
+	if resp == nil || resp.Success {
+		t.Error("Expected unsuccessful write response")
 	}
 }

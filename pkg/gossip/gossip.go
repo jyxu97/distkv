@@ -171,11 +171,22 @@ func (g *Gossip) Stop() error {
 // AddNode adds a new node to the cluster view.
 // This is typically called when a node joins the cluster.
 func (g *Gossip) AddNode(nodeID, address string) {
+	g.addNode(nodeID, address, false)
+}
+
+// AddJoiningNode adds a node that is still bootstrapping. It is inserted with
+// Joining already set so the node is never briefly visible as readable.
+func (g *Gossip) AddJoiningNode(nodeID, address string) {
+	g.addNode(nodeID, address, true)
+}
+
+func (g *Gossip) addNode(nodeID, address string, joining bool) {
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
 
 	if _, exists := g.nodes[nodeID]; !exists {
 		nodeInfo := NewNodeInfo(nodeID, address)
+		nodeInfo.Joining = joining
 		g.nodes[nodeID] = nodeInfo
 
 		// Notify callbacks about new node
@@ -186,6 +197,18 @@ func (g *Gossip) AddNode(nodeID, address string) {
 			NewStatus: NodeAlive,
 			Timestamp: time.Now(),
 		})
+	}
+}
+
+// SetLocalJoining marks the local node as bootstrapping (or done). Peers pick
+// up the change with the next heartbeat, since merges are ordered by heartbeat.
+func (g *Gossip) SetLocalJoining(joining bool) {
+	g.localNode.SetJoining(joining)
+
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+	if localNodeCopy, exists := g.nodes[g.localNode.NodeID]; exists {
+		localNodeCopy.SetJoining(joining)
 	}
 }
 
@@ -377,6 +400,7 @@ func (g *Gossip) updateLocalHeartbeat() {
 		localNodeCopy.HeartbeatCounter = g.localNode.GetHeartbeatCounter()
 		localNodeCopy.LastSeen = g.localNode.GetLastSeen()
 		localNodeCopy.Version = g.localNode.GetVersion()
+		localNodeCopy.Joining = g.localNode.IsJoining()
 	}
 	g.mutex.Unlock()
 }
@@ -568,6 +592,7 @@ func (g *Gossip) convertToProtoMessage(message *GossipMessageData) *pb.GossipMes
 			HeartbeatCounter: nodeInfo.GetHeartbeatCounter(),
 			LastSeen:         nodeInfo.GetLastSeen(),
 			Status:           g.convertStatusToProto(nodeInfo.GetStatus()),
+			Joining:          nodeInfo.IsJoining(),
 		}
 		protoNodeUpdates = append(protoNodeUpdates, protoNodeInfo)
 	}
@@ -605,6 +630,7 @@ func (g *Gossip) processGossipResponse(senderID string, response *pb.GossipRespo
 			HeartbeatCounter: protoNodeInfo.HeartbeatCounter,
 			LastSeen:         protoNodeInfo.LastSeen,
 			Status:           internalStatus,
+			Joining:          protoNodeInfo.Joining,
 			Version:          1, // We don't have version in proto, so set to 1
 		}
 		nodeUpdates = append(nodeUpdates, nodeInfo)

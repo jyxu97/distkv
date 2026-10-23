@@ -34,15 +34,14 @@ This guide covers operational aspects of running DistKV in production.
 ./distkv-server -node-id=node4 -address=10.0.1.13:8080 -data-dir=/var/lib/distkv -seed-nodes=10.0.1.10:8080,10.0.1.11:8080
 ```
 
+   The node joins in a `joining` state: it receives writes for its new token
+   ranges but serves no reads until it has streamed those ranges from its
+   peers. Startup logs `Bootstrap complete, serving reads` when done.
+
 3. **Verify node joined**:
 ```bash
 ./distkv-client status
 # Should show 4 nodes
-```
-
-4. **Optional: Trigger rebalancing**:
-```bash
-./distkv-client -server=10.0.1.10:8080 rebalance
 ```
 
 ### Removing Nodes

@@ -29,7 +29,7 @@ func main() {
 	newNode := flag.String("new-node", "localhost:8083", "Address of the new node to verify after scale-out")
 	keys := flag.Int("keys", 100, "Number of keys to sample")
 	replicas := flag.Int("replicas", 3, "Replication factor N")
-	wait := flag.Int("wait", 40, "Seconds to wait for anti-entropy after node is added")
+	wait := flag.Int("wait", 5, "Seconds to wait for the new node to finish bootstrap")
 	flag.Parse()
 
 	// Connect to coordinator
@@ -58,7 +58,7 @@ func main() {
 	fmt.Print("Press Enter when the new node has joined the cluster...")
 	bufio.NewReader(os.Stdin).ReadString('\n')
 
-	fmt.Printf("Waiting %d seconds for anti-entropy to sync keys to the new node...\n", *wait)
+	fmt.Printf("Waiting %d seconds for the new node to finish bootstrap...\n", *wait)
 	time.Sleep(time.Duration(*wait) * time.Second)
 
 	// ── Phase 2: after scale-out ───────────────────────────────────────────────

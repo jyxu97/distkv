@@ -150,6 +150,12 @@ func (ch *ConsistentHash) GetNode(key string) string {
 // GetNodes returns N nodes responsible for a key (for replication).
 // It finds the first N unique physical nodes clockwise from the key's position.
 func (ch *ConsistentHash) GetNodes(key string, count int) []string {
+	return ch.GetNodesExcluding(key, count, nil)
+}
+
+// GetNodesExcluding is like GetNodes but skips any physical node for which
+// exclude returns true, as if it were not on the ring. A nil exclude skips none.
+func (ch *ConsistentHash) GetNodesExcluding(key string, count int, exclude func(nodeID string) bool) []string {
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
 
@@ -157,19 +163,26 @@ func (ch *ConsistentHash) GetNodes(key string, count int) []string {
 		return nil
 	}
 
-	// Cap count to available nodes
-	if count > len(ch.nodes) {
-		count = len(ch.nodes)
-	}
-
 	keyHash := ch.hash(key)
-	result := make([]string, 0, count)
-	seen := make(map[string]bool)
 
 	// Find starting position
 	startIdx := sort.Search(len(ch.sortedKeys), func(i int) bool {
 		return ch.sortedKeys[i] >= keyHash
 	})
+
+	return ch.walkLocked(startIdx, count, exclude)
+}
+
+// walkLocked collects up to count unique physical nodes clockwise from
+// sortedKeys[startIdx], skipping excluded nodes. Caller must hold ch.mu.
+func (ch *ConsistentHash) walkLocked(startIdx, count int, exclude func(nodeID string) bool) []string {
+	// Cap count to available nodes
+	if count > len(ch.nodes) {
+		count = len(ch.nodes)
+	}
+
+	result := make([]string, 0, count)
+	seen := make(map[string]bool)
 
 	// Collect unique nodes starting from the position
 	for i := 0; i < len(ch.sortedKeys) && len(result) < count; i++ {
@@ -178,13 +191,89 @@ func (ch *ConsistentHash) GetNodes(key string, count int) []string {
 		nodeID := ch.ring[ch.sortedKeys[idx]]
 
 		// Add only unique physical nodes
-		if !seen[nodeID] {
-			seen[nodeID] = true
-			result = append(result, nodeID)
+		if seen[nodeID] {
+			continue
 		}
+		seen[nodeID] = true
+		if exclude != nil && exclude(nodeID) {
+			continue
+		}
+		result = append(result, nodeID)
 	}
 
 	return result
+}
+
+// TokenRange is a span of the hash ring covering hashes in (Start, End],
+// wrapping past zero when Start >= End. Start == End means the whole ring.
+type TokenRange struct {
+	Start uint32
+	End   uint32
+}
+
+// Contains reports whether hash h falls inside the range.
+func (r TokenRange) Contains(h uint32) bool {
+	switch {
+	case r.Start == r.End:
+		return true
+	case r.Start < r.End:
+		return h > r.Start && h <= r.End
+	default:
+		return h > r.Start || h <= r.End
+	}
+}
+
+// HashKey returns the ring position of a key, for matching against TokenRanges.
+func (ch *ConsistentHash) HashKey(key string) uint32 {
+	return ch.hash(key)
+}
+
+// TokenRangesFor returns the ring ranges for which nodeID is one of the first
+// count replicas, i.e. every key nodeID must store with replication factor count.
+func (ch *ConsistentHash) TokenRangesFor(nodeID string, count int) []TokenRange {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
+	n := len(ch.sortedKeys)
+	if n == 0 || !ch.nodes[nodeID] {
+		return nil
+	}
+
+	// Each virtual node at sortedKeys[i] owns the segment (sortedKeys[i-1], sortedKeys[i]],
+	// and keys in that segment are replicated to the walk starting at i.
+	var ranges []TokenRange
+	covered := 0
+	for i := 0; i < n; i++ {
+		start := ch.sortedKeys[(i-1+n)%n]
+		end := ch.sortedKeys[i]
+		if start == end && n > 1 {
+			continue // Duplicate token from a hash collision; empty segment
+		}
+
+		owned := false
+		for _, id := range ch.walkLocked(i, count, nil) {
+			if id == nodeID {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			continue
+		}
+
+		covered++
+		// Merge with the previous range when the segments are adjacent
+		if len(ranges) > 0 && ranges[len(ranges)-1].End == start {
+			ranges[len(ranges)-1].End = end
+		} else {
+			ranges = append(ranges, TokenRange{Start: start, End: end})
+		}
+	}
+
+	if covered == n {
+		return []TokenRange{{Start: ch.sortedKeys[0], End: ch.sortedKeys[0]}}
+	}
+	return ranges
 }
 
 // GetAllNodes returns all nodes currently in the hash ring.

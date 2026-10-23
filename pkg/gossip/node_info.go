@@ -54,6 +54,12 @@ type NodeInfo struct {
 	// Status indicates if the node is alive, suspect, or dead
 	Status NodeStatus
 
+	// Joining is true while the node is bootstrapping its key ranges. It is
+	// orthogonal to Status (liveness): a joining node receives writes for its
+	// new ranges but must not serve reads until it has streamed their data.
+	// Only the node itself changes this flag; peers learn it through gossip.
+	Joining bool
+
 	// Version tracks the version of this node info for conflict resolution
 	Version uint64
 
@@ -113,6 +119,25 @@ func (ni *NodeInfo) GetStatus() NodeStatus {
 	defer ni.mutex.RUnlock()
 
 	return ni.Status
+}
+
+// SetJoining marks whether the node is still bootstrapping.
+func (ni *NodeInfo) SetJoining(joining bool) {
+	ni.mutex.Lock()
+	defer ni.mutex.Unlock()
+
+	if ni.Joining != joining {
+		ni.Joining = joining
+		ni.Version++
+	}
+}
+
+// IsJoining returns true if the node is still bootstrapping.
+func (ni *NodeInfo) IsJoining() bool {
+	ni.mutex.RLock()
+	defer ni.mutex.RUnlock()
+
+	return ni.Joining
 }
 
 // GetHeartbeatCounter returns the current heartbeat counter.
@@ -184,6 +209,7 @@ func (ni *NodeInfo) MergeFrom(other *NodeInfo) bool {
 		// timestamps must not propagate across gossip hops.
 		ni.LastSeen = time.Now().Unix()
 		ni.Status = other.Status
+		ni.Joining = other.Joining
 		ni.Version = other.Version
 		updated = true
 	}
@@ -203,6 +229,7 @@ func (ni *NodeInfo) Copy() *NodeInfo {
 		HeartbeatCounter: ni.HeartbeatCounter,
 		LastSeen:         ni.LastSeen,
 		Status:           ni.Status,
+		Joining:          ni.Joining,
 		Version:          ni.Version,
 	}
 }
@@ -231,8 +258,8 @@ func (ni *NodeInfo) String() string {
 	ni.mutex.RLock()
 	defer ni.mutex.RUnlock()
 
-	return fmt.Sprintf("NodeInfo{ID:%s, Addr:%s, HB:%d, Status:%s, Ver:%d}",
-		ni.NodeID, ni.Address, ni.HeartbeatCounter, ni.Status, ni.Version)
+	return fmt.Sprintf("NodeInfo{ID:%s, Addr:%s, HB:%d, Status:%s, Joining:%t, Ver:%d}",
+		ni.NodeID, ni.Address, ni.HeartbeatCounter, ni.Status, ni.Joining, ni.Version)
 }
 
 // GossipConfig holds configuration for the gossip protocol.
