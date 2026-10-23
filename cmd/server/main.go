@@ -101,7 +101,10 @@ func main() {
 	logger.Info("DistKV server starting")
 
 	// Parse command line flags
-	config := parseFlags()
+	config, err := parseFlags(flag.CommandLine, os.Args[1:])
+	if err != nil {
+		logger.WithError(err).Fatal("Invalid command line flags")
+	}
 
 	// Validate configuration
 	if err := validateConfig(config); err != nil {
@@ -144,43 +147,48 @@ func main() {
 	}
 }
 
-// parseFlags parses command line arguments and returns server configuration
-func parseFlags() *ServerConfig {
+// parseFlags parses command line arguments and returns server configuration.
+// The flag set is a parameter so tests can parse without touching flag.CommandLine.
+func parseFlags(fs *flag.FlagSet, args []string) (*ServerConfig, error) {
 	var (
-		nodeID           = flag.String("node-id", "", "Unique node identifier (required)")
-		address          = flag.String("address", "localhost:8080", "Server listen address")
-		advertiseAddress = flag.String("advertise-address", "", "Address advertised to cluster peers (defaults to --address)")
-		dataDir          = flag.String("data-dir", "./data", "Directory for data storage")
-		seedNodes        = flag.String("seed-nodes", "", "Comma-separated list of seed nodes")
-		virtualNodes     = flag.Int("virtual-nodes", 150, "Number of virtual nodes for consistent hashing")
+		nodeID           = fs.String("node-id", "", "Unique node identifier (required)")
+		address          = fs.String("address", "localhost:8080", "Server listen address")
+		advertiseAddress = fs.String("advertise-address", "", "Address advertised to cluster peers (defaults to --address)")
+		dataDir          = fs.String("data-dir", "./data", "Directory for data storage")
+		seedNodes        = fs.String("seed-nodes", "", "Comma-separated list of seed nodes")
+		virtualNodes     = fs.Int("virtual-nodes", 150, "Number of virtual nodes for consistent hashing")
 
 		// Storage flags
-		memTableSize     = flag.Int("mem-table-size", 1024, "MemTable size in bytes")
-		ssTableSize      = flag.Int64("sstable-size", 256*1024*1024, "SSTable size in bytes")
-		bloomFilterBits  = flag.Int("bloom-filter-bits", 10, "Bloom filter bits per key")
-		compactionThresh = flag.Int("compaction-threshold", 4, "Number of SSTables to trigger compaction")
+		memTableSize     = fs.Int("mem-table-size", 1024, "MemTable size in bytes")
+		ssTableSize      = fs.Int64("sstable-size", 256*1024*1024, "SSTable size in bytes")
+		bloomFilterBits  = fs.Int("bloom-filter-bits", 10, "Bloom filter bits per key")
+		compactionThresh = fs.Int("compaction-threshold", 4, "Number of SSTables to trigger compaction")
+		walEnabled       = fs.Bool("wal-enabled", true, "Write a write-ahead log before each MemTable insert")
+		walSync          = fs.Bool("wal-sync", true, "fsync the WAL before acknowledging each write (false risks losing recent writes on power loss)")
 
 		// Replication flags
-		replicas    = flag.Int("replicas", 3, "Number of replicas (N)")
-		readQuorum  = flag.Int("read-quorum", 2, "Read quorum size (R)")
-		writeQuorum = flag.Int("write-quorum", 2, "Write quorum size (W)")
+		replicas    = fs.Int("replicas", 3, "Number of replicas (N)")
+		readQuorum  = fs.Int("read-quorum", 2, "Read quorum size (R)")
+		writeQuorum = fs.Int("write-quorum", 2, "Write quorum size (W)")
 
 		// Gossip flags
-		heartbeatInterval = flag.Duration("heartbeat-interval", 1*time.Second, "Heartbeat interval")
-		suspectTimeout    = flag.Duration("suspect-timeout", 30*time.Second, "Suspect timeout")
-		deadTimeout       = flag.Duration("dead-timeout", 120*time.Second, "Dead timeout")
-		gossipInterval    = flag.Duration("gossip-interval", 1*time.Second, "Gossip interval")
-		gossipFanout      = flag.Int("gossip-fanout", 3, "Gossip fanout")
+		heartbeatInterval = fs.Duration("heartbeat-interval", 1*time.Second, "Heartbeat interval")
+		suspectTimeout    = fs.Duration("suspect-timeout", 30*time.Second, "Suspect timeout")
+		deadTimeout       = fs.Duration("dead-timeout", 120*time.Second, "Dead timeout")
+		gossipInterval    = fs.Duration("gossip-interval", 1*time.Second, "Gossip interval")
+		gossipFanout      = fs.Int("gossip-fanout", 3, "Gossip fanout")
 
 		// TLS flags
-		tlsEnabled    = flag.Bool("tls-enabled", false, "Enable TLS for secure communication")
-		tlsCertFile   = flag.String("tls-cert-file", "", "Path to TLS certificate file")
-		tlsKeyFile    = flag.String("tls-key-file", "", "Path to TLS private key file")
-		tlsCAFile     = flag.String("tls-ca-file", "", "Path to TLS CA certificate file for client verification")
-		tlsClientAuth = flag.String("tls-client-auth", "NoClientCert", "Client authentication policy: NoClientCert, RequestClientCert, RequireAnyClientCert, VerifyClientCertIfGiven, RequireAndVerifyClientCert")
+		tlsEnabled    = fs.Bool("tls-enabled", false, "Enable TLS for secure communication")
+		tlsCertFile   = fs.String("tls-cert-file", "", "Path to TLS certificate file")
+		tlsKeyFile    = fs.String("tls-key-file", "", "Path to TLS private key file")
+		tlsCAFile     = fs.String("tls-ca-file", "", "Path to TLS CA certificate file for client verification")
+		tlsClientAuth = fs.String("tls-client-auth", "NoClientCert", "Client authentication policy: NoClientCert, RequestClientCert, RequireAnyClientCert, VerifyClientCertIfGiven, RequireAndVerifyClientCert")
 	)
 
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
 
 	// Generate node ID if not provided
 	if *nodeID == "" {
@@ -218,7 +226,7 @@ func parseFlags() *ServerConfig {
 		clientAuthType = cryptotls.NoClientCert
 	}
 
-	return &ServerConfig{
+	config := &ServerConfig{
 		NodeID:           *nodeID,
 		Address:          *address,
 		AdvertiseAddress: *advertiseAddress,
@@ -239,6 +247,8 @@ func parseFlags() *ServerConfig {
 			WriteBufferSize:     4 * 1024 * 1024,
 			CacheSize:           128 * 1024 * 1024,
 			MaxOpenFiles:        1000,
+			WALEnabled:          *walEnabled,
+			WALSyncOnPut:        *walSync,
 		},
 
 		QuorumConfig: &replication.QuorumConfig{
@@ -267,6 +277,7 @@ func parseFlags() *ServerConfig {
 			ClientAuth: clientAuthType,
 		},
 	}
+	return config, nil
 }
 
 // validateConfig validates the server configuration

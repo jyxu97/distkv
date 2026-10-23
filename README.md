@@ -121,6 +121,10 @@ Options:
   -write-quorum int        Write quorum size W (default: 2)
   -virtual-nodes int       Virtual nodes for consistent hashing (default: 150)
 
+Durability Options:
+  -wal-enabled             Write a write-ahead log before each MemTable insert (default: true)
+  -wal-sync                fsync the WAL before acknowledging each write (default: true)
+
 TLS Options:
   -tls-enabled             Enable TLS (default: false)
   -tls-cert-file string    Path to TLS certificate file
