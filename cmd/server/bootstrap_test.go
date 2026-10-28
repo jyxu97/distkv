@@ -26,15 +26,15 @@ func freeAddress(t *testing.T) string {
 	return l.Addr().String()
 }
 
-// startTestNode creates and starts a DistKV server joined via the given seeds.
-func startTestNode(t *testing.T, nodeID string, quorum *replication.QuorumConfig, seeds ...string) *DistKVServer {
+// newTestConfig returns a server config on a free localhost port with fast gossip.
+func newTestConfig(t *testing.T, nodeID string, quorum *replication.QuorumConfig, dataDir string, seeds ...string) *ServerConfig {
 	t.Helper()
 	address := freeAddress(t)
-	config := &ServerConfig{
+	return &ServerConfig{
 		NodeID:           nodeID,
 		Address:          address,
 		AdvertiseAddress: address,
-		DataDir:          t.TempDir(),
+		DataDir:          dataDir,
 		SeedNodes:        seeds,
 		VirtualNodes:     50,
 		StorageConfig:    storage.DefaultStorageConfig(),
@@ -49,16 +49,26 @@ func startTestNode(t *testing.T, nodeID string, quorum *replication.QuorumConfig
 		},
 		TLSConfig: &tls.Config{Enabled: false},
 	}
+}
 
+// startServer creates and starts a DistKV server from config, stopping it at test end.
+func startServer(t *testing.T, config *ServerConfig) *DistKVServer {
+	t.Helper()
 	server, err := NewDistKVServer(config)
 	if err != nil {
-		t.Fatalf("failed to create node %s: %v", nodeID, err)
+		t.Fatalf("failed to create node %s: %v", config.NodeID, err)
 	}
 	if err := server.Start(); err != nil {
-		t.Fatalf("failed to start node %s: %v", nodeID, err)
+		t.Fatalf("failed to start node %s: %v", config.NodeID, err)
 	}
 	t.Cleanup(func() { _ = server.Stop() })
 	return server
+}
+
+// startTestNode creates and starts a DistKV server joined via the given seeds.
+func startTestNode(t *testing.T, nodeID string, quorum *replication.QuorumConfig, seeds ...string) *DistKVServer {
+	t.Helper()
+	return startServer(t, newTestConfig(t, nodeID, quorum, t.TempDir(), seeds...))
 }
 
 // waitForCluster blocks until every server's hash ring contains size nodes and

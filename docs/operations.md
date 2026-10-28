@@ -168,7 +168,7 @@ When the client detects siblings, it should:
 
 1. Read all sibling values and their vector clocks
 2. Apply application-specific merge logic (e.g., last-writer-wins, union, custom merge)
-3. Write back the resolved value with a `PUT`, which creates a new vector clock that supersedes all siblings
+3. Write back the resolved value with a `PUT` that passes the GET's `vector_clock` as its causal context; that context covers every sibling, so the new version supersedes all of them. A blind `PUT` (as the CLI sends) is concurrent with the siblings rather than descended from them
 
 ```bash
 # Example: client detects conflict

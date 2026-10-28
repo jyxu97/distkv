@@ -91,7 +91,7 @@ type WriteRequest struct {
 // WriteResponse represents the response from a write operation.
 type WriteResponse struct {
 	Success         bool                   // Whether the write succeeded
-	VectorClock     *consensus.VectorClock // Updated vector clock
+	VectorClock     *consensus.VectorClock // Version stored by the replicas (the request's clock)
 	ReplicasWritten int                    // Number of replicas that acknowledged
 	Errors          []error                // Any errors that occurred
 }
@@ -171,6 +171,25 @@ type StorageEngine interface {
 	Get(key string) (*storage.Entry, error)
 	Delete(key string, vectorClock *consensus.VectorClock) error
 	Iterator() (storage.Iterator, error)
+
+	// WriteIf atomically writes entry if cond approves the key's current
+	// entry (nil if absent, tombstones included). See storage.Engine.WriteIf.
+	WriteIf(entry *storage.Entry, cond func(current *storage.Entry) bool) (bool, *storage.Entry, error)
+}
+
+// Supersedes reports whether the locally stored entry makes an incoming
+// version obsolete: the stored clock is causally after the incoming one, or
+// both carry the same clock and the stored entry is a tombstone (a delete wins
+// over a value at the same version). Writing a superseded version would roll
+// the key back, so replicas refuse it.
+func Supersedes(current *storage.Entry, incoming *consensus.VectorClock, incomingDeleted bool) bool {
+	if current == nil || current.VectorClock == nil || incoming == nil {
+		return false
+	}
+	if current.VectorClock.IsAfter(incoming) {
+		return true
+	}
+	return current.Deleted && !incomingDeleted && current.VectorClock.Equal(incoming)
 }
 
 // NewQuorumManager creates a new quorum manager.
@@ -267,23 +286,23 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 		}(replica)
 	}
 
-	// Collect responses until we have enough successful writes
+	// Collect responses until we have enough successful writes. Every replica
+	// stores exactly req.VectorClock, so a successful ACK must echo it; an ACK
+	// reporting any other version is not an acknowledgment of this write.
 	var successfulWrites int
 	var errs []error
-	var latestVectorClock *consensus.VectorClock
 
 	for i := 0; i < len(targets) && successfulWrites < required; i++ {
 		select {
 		case response := <-responseChan:
-			if response.Success {
-				successfulWrites++
-				// Keep track of the most recent vector clock
-				if latestVectorClock == nil ||
-					(response.VectorClock != nil && response.VectorClock.IsAfter(latestVectorClock)) {
-					latestVectorClock = response.VectorClock
-				}
-			} else {
+			switch {
+			case !response.Success:
 				errs = append(errs, fmt.Errorf("node %s: %v", response.NodeID, response.Error))
+			case req.VectorClock != nil && (response.VectorClock == nil || !response.VectorClock.Equal(req.VectorClock)):
+				errs = append(errs, fmt.Errorf("node %s: acknowledged version %v, expected %v",
+					response.NodeID, response.VectorClock, req.VectorClock))
+			default:
+				successfulWrites++
 			}
 		case <-ctx.Done():
 			return &WriteResponse{
@@ -304,7 +323,7 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 		}).Debug("Quorum write succeeded")
 		return &WriteResponse{
 			Success:         true,
-			VectorClock:     latestVectorClock,
+			VectorClock:     req.VectorClock,
 			ReplicasWritten: successfulWrites,
 			Errors:          errs,
 		}, nil
@@ -538,7 +557,10 @@ func (qm *QuorumManager) repairStaleReplicas(key string, winningValue []byte, wi
 	defer cancel()
 
 	for _, resp := range responses {
-		if resp.VectorClock == nil || !winningVC.IsAfter(resp.VectorClock) {
+		// A replica without the key reports no clock; it is behind the winner too.
+		// Replicas refuse versions their local entry supersedes, so a repair
+		// racing with a newer write cannot roll the key back.
+		if resp.VectorClock != nil && !winningVC.IsAfter(resp.VectorClock) {
 			continue // Already up to date or ordering is indeterminate
 		}
 		qm.logger.WithFields(map[string]interface{}{

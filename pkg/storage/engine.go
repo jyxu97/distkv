@@ -162,6 +162,27 @@ func NewEngine(dataDir string, config *StorageConfig) (*Engine, error) {
 // Put stores a key-value pair in the storage engine.
 // This is the main write path for the LSM-tree.
 func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorClock) error {
+	if value == nil {
+		e.metrics.Storage().WriteErrors.Add(1)
+		return errors.New(errors.ErrCodeInvalidValue, "value cannot be nil")
+	}
+	_, _, err := e.WriteIf(NewEntry(key, value, vectorClock), nil)
+	return err
+}
+
+// Delete marks a key as deleted by inserting a tombstone.
+func (e *Engine) Delete(key string, vectorClock *consensus.VectorClock) error {
+	_, _, err := e.WriteIf(NewDeleteEntry(key, vectorClock), nil)
+	return err
+}
+
+// WriteIf stores entry (a value or a tombstone) only if cond approves the key's
+// current local entry. current is nil when the key is absent, and is the raw
+// entry otherwise, tombstones included. cond runs under the engine's write
+// lock, so the check and the write are atomic with respect to every other
+// writer; a nil cond always writes. It returns whether the entry was written
+// and the entry that was current before the call.
+func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *Entry, error) {
 	// Track latency
 	tracker := metrics.NewLatencyTracker()
 	defer func() {
@@ -170,13 +191,10 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 	}()
 
 	// Validate inputs
+	key := entry.Key
 	if key == "" {
 		e.metrics.Storage().WriteErrors.Add(1)
-		return errors.New(errors.ErrCodeInvalidKey, "key cannot be empty")
-	}
-	if value == nil {
-		e.metrics.Storage().WriteErrors.Add(1)
-		return errors.New(errors.ErrCodeInvalidValue, "value cannot be nil")
+		return false, nil, errors.New(errors.ErrCodeInvalidKey, "key cannot be empty")
 	}
 
 	e.mutex.Lock()
@@ -184,11 +202,23 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 	if e.closed {
 		e.mutex.Unlock()
 		e.metrics.Storage().WriteErrors.Add(1)
-		return errors.NewStorageClosedError()
+		return false, nil, errors.NewStorageClosedError()
 	}
 
-	// Create entry
-	entry := NewEntry(key, value, vectorClock)
+	var current *Entry
+	if cond != nil {
+		found, _, err := e.lookupLocked(key)
+		if err != nil && err != ErrKeyNotFound {
+			e.mutex.Unlock()
+			e.metrics.Storage().WriteErrors.Add(1)
+			return false, nil, err
+		}
+		current = found
+		if !cond(current) {
+			e.mutex.Unlock()
+			return false, current, nil
+		}
+	}
 
 	// Durability: append to the write-ahead log and fsync BEFORE inserting into
 	// the MemTable. If we crash after this returns, the write is recoverable on
@@ -200,19 +230,19 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 			e.stats.WriteErrors++
 			e.metrics.Storage().WriteErrors.Add(1)
 			e.logger.WithError(err).WithField("key", key).Error("Failed to append to WAL")
-			return errors.Wrap(err, errors.ErrCodeInternal, "failed to append to WAL")
+			return false, current, errors.Wrap(err, errors.ErrCodeInternal, "failed to append to WAL")
 		}
 	}
 
 	// Estimate memory usage and check limits
-	estimatedSize := int64(len(key) + len(value) + 64) // Rough estimate
+	estimatedSize := int64(len(key) + len(entry.Value) + 64) // Rough estimate
 	if err := e.memoryMonitor.RecordMemTableAllocation(estimatedSize); err != nil {
 		e.stats.WriteErrors++
 		e.metrics.Storage().WriteErrors.Add(1)
 		e.mutex.Unlock()
 		e.logger.WithError(err).WithField("estimatedSize", estimatedSize).
 			Error("Memory limit exceeded, cannot write entry")
-		return err
+		return false, current, err
 	}
 
 	// Add to active MemTable
@@ -223,7 +253,7 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 		e.metrics.Storage().WriteErrors.Add(1)
 		e.mutex.Unlock()
 		e.logger.WithError(err).WithField("key", key).Error("Failed to put entry to MemTable")
-		return errors.Wrap(err, errors.ErrCodeInternal, "failed to put entry to MemTable")
+		return false, current, errors.Wrap(err, errors.ErrCodeInternal, "failed to put entry to MemTable")
 	}
 
 	// Update stats and metrics
@@ -250,12 +280,26 @@ func (e *Engine) Put(key string, value []byte, vectorClock *consensus.VectorCloc
 		e.performFlush()
 	}
 
-	return nil
+	return true, current, nil
 }
 
 // Get retrieves a value by key from the storage engine.
 // This implements the LSM-tree read path: MemTable first, then SSTables.
+// Deleted keys report ErrKeyNotFound; use GetEntry to see tombstones.
 func (e *Engine) Get(key string) (*Entry, error) {
+	entry, err := e.GetEntry(key)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Deleted {
+		return nil, ErrKeyNotFound // Tombstone found
+	}
+	return entry, nil
+}
+
+// GetEntry is like Get but returns tombstones instead of hiding them, so
+// callers comparing versions can see a delete's vector clock.
+func (e *Engine) GetEntry(key string) (*Entry, error) {
 	// Track latency
 	tracker := metrics.NewLatencyTracker()
 	defer func() {
@@ -287,90 +331,54 @@ func (e *Engine) Get(key string) (*Entry, error) {
 		e.metrics.Storage().ReadOps.Add(1)
 	}()
 
+	entry, inMemory, err := e.lookupLocked(key)
+	if inMemory {
+		e.metrics.Storage().CacheHits.Add(1) // MemTable is effectively a cache
+	} else {
+		e.metrics.Storage().CacheMisses.Add(1)
+	}
+	if err != nil && err != ErrKeyNotFound {
+		e.statsMu.Lock()
+		e.stats.ReadErrors++
+		e.statsMu.Unlock()
+		e.metrics.Storage().ReadErrors.Add(1)
+		e.logger.WithError(err).WithField("key", key).
+			Error("Error reading from SSTable")
+		return nil, errors.Wrap(err, errors.ErrCodeInternal,
+			"failed to read from SSTable")
+	}
+	return entry, err
+}
+
+// lookupLocked finds the newest entry for key, tombstones included, and
+// reports whether it came from a MemTable. Caller must hold e.mutex.
+func (e *Engine) lookupLocked(key string) (*Entry, bool, error) {
 	// First check active MemTable
 	if entry := e.activeMemTable.Get(key); entry != nil {
-		e.metrics.Storage().CacheHits.Add(1) // MemTable is effectively a cache
-		if entry.Deleted {
-			return nil, ErrKeyNotFound // Tombstone found
-		}
-		return entry, nil
+		return entry, true, nil
 	}
 
 	// Check flushing MemTables
 	for _, memTable := range e.flushingMemTables {
 		if entry := memTable.Get(key); entry != nil {
-			e.metrics.Storage().CacheHits.Add(1)
-			if entry.Deleted {
-				return nil, ErrKeyNotFound // Tombstone found
-			}
-			return entry, nil
+			return entry, true, nil
 		}
 	}
 
 	// Check SSTables level by level (lower levels first - more recent data)
-	e.metrics.Storage().CacheMisses.Add(1)
 	for level := 0; level < len(e.sstables); level++ {
 		for i := len(e.sstables[level]) - 1; i >= 0; i-- {
 			entry, err := e.sstables[level][i].Get(key)
 			if err == nil {
-				if entry.Deleted {
-					return nil, ErrKeyNotFound // Tombstone found
-				}
-				return entry, nil
+				return entry, false, nil
 			}
 			if err != ErrKeyNotFound {
-				e.statsMu.Lock()
-				e.stats.ReadErrors++
-				e.statsMu.Unlock()
-				e.metrics.Storage().ReadErrors.Add(1)
-				e.logger.WithError(err).WithField("key", key).
-					Error("Error reading from SSTable")
-				return nil, errors.Wrap(err, errors.ErrCodeInternal,
-					"failed to read from SSTable")
+				return nil, false, err
 			}
 		}
 	}
 
-	return nil, ErrKeyNotFound
-}
-
-// Delete marks a key as deleted by inserting a tombstone.
-func (e *Engine) Delete(key string, vectorClock *consensus.VectorClock) error {
-	e.mutex.Lock()
-	defer e.mutex.Unlock()
-
-	if e.closed {
-		return ErrStorageClosed
-	}
-
-	// Create tombstone entry
-	entry := NewDeleteEntry(key, vectorClock)
-
-	// Durability: persist the tombstone to the WAL before inserting it into the
-	// MemTable, so an acknowledged delete survives a crash just like a put.
-	if e.wal != nil {
-		if err := e.wal.Append(entry); err != nil {
-			e.stats.WriteErrors++
-			e.logger.WithError(err).WithField("key", key).Error("Failed to append delete to WAL")
-			return errors.Wrap(err, errors.ErrCodeInternal, "failed to append delete to WAL")
-		}
-	}
-
-	// Add tombstone to active MemTable
-	if err := e.activeMemTable.Put(*entry); err != nil {
-		e.stats.WriteErrors++
-		return fmt.Errorf("failed to put delete entry: %v", err)
-	}
-
-	// Update stats
-	e.stats.WriteCount++
-
-	// Check if MemTable needs to be flushed
-	if e.activeMemTable.Size() >= int64(e.config.MemTableMaxSize) {
-		e.triggerFlush()
-	}
-
-	return nil
+	return nil, false, ErrKeyNotFound
 }
 
 // Iterator returns an iterator that scans all key-value pairs.
@@ -552,15 +560,6 @@ func (e *Engine) CrashForTesting() {
 	// only copy of the unflushed writes and must survive to be replayed.
 	if e.wal != nil {
 		_ = e.wal.Close()
-	}
-}
-
-// triggerFlush signals that a MemTable flush is needed.
-func (e *Engine) triggerFlush() {
-	select {
-	case e.flushChan <- struct{}{}:
-	default:
-		// Channel full, flush already pending
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"distkv/pkg/consensus"
 	"distkv/pkg/logging"
+	"distkv/pkg/storage"
 )
 
 // PeerInfo identifies a peer node for anti-entropy communication.
@@ -148,16 +149,21 @@ func (am *AntiEntropyManager) syncWithPeer(ctx context.Context, peer PeerInfo, l
 }
 
 // MergeEntry applies an entry received from a peer if the key is missing
-// locally or the entry is causally newer. Concurrent versions (siblings) are
-// skipped — read repair and application merge handle those.
+// locally or the entry is causally newer than the local entry (tombstones
+// included, so a stale value cannot resurrect a delete). Concurrent versions
+// (siblings) are skipped — read repair and application merge handle those.
+// The check and the write are atomic with respect to other local writers.
 func MergeEntry(storageEngine StorageEngine, entry AntiEntropyEntry) error {
-	existing, _ := storageEngine.Get(entry.Key)
-	if existing != nil {
-		if entry.VectorClock == nil || existing.VectorClock == nil || !entry.VectorClock.IsAfter(existing.VectorClock) {
-			return nil
-		}
-	}
-	return storageEngine.Put(entry.Key, entry.Value, entry.VectorClock)
+	_, _, err := storageEngine.WriteIf(
+		storage.NewEntry(entry.Key, entry.Value, entry.VectorClock),
+		func(current *storage.Entry) bool {
+			if current == nil {
+				return true
+			}
+			return entry.VectorClock != nil && current.VectorClock != nil &&
+				entry.VectorClock.IsAfter(current.VectorClock)
+		})
+	return err
 }
 
 // buildHash computes a SHA-256 over all non-deleted local entries.

@@ -255,3 +255,71 @@ func TestEngine_WALDisabled(t *testing.T) {
 		t.Fatalf("with WAL disabled, expected write to be lost after crash, got err=%v", err)
 	}
 }
+
+// TestEngine_WriteIfSeesTombstonesAndRefusesStale verifies the conditional
+// write used by replicas: the condition sees the current entry including a
+// tombstone, a refused write leaves the key untouched, and a tombstone's clock
+// survives crash recovery so it can still supersede stale values afterwards.
+func TestEngine_WriteIfSeesTombstonesAndRefusesStale(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	engine, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	older := consensus.NewVectorClockFromMap(map[string]uint64{"A": 1})
+	newer := consensus.NewVectorClockFromMap(map[string]uint64{"A": 2})
+
+	if err := engine.Put("k", []byte("v1"), older); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := engine.Delete("k", newer); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	notSuperseded := func(incoming *consensus.VectorClock) func(*storage.Entry) bool {
+		return func(current *storage.Entry) bool {
+			return current == nil || !current.VectorClock.IsAfter(incoming)
+		}
+	}
+
+	// A delayed copy of the older value must not resurrect the deleted key
+	applied, current, err := engine.WriteIf(storage.NewEntry("k", []byte("v1"), older), notSuperseded(older))
+	if err != nil {
+		t.Fatalf("WriteIf: %v", err)
+	}
+	if applied {
+		t.Fatal("Expected stale write to be refused")
+	}
+	if current == nil || !current.Deleted || !current.VectorClock.Equal(newer) {
+		t.Fatalf("Expected the condition to see the tombstone at %s, got %+v", newer, current)
+	}
+
+	// The tombstone and its clock survive a crash
+	engine.CrashForTesting()
+	recovered, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("NewEngine after crash: %v", err)
+	}
+	defer recovered.Close()
+
+	entry, err := recovered.GetEntry("k")
+	if err != nil {
+		t.Fatalf("GetEntry after recovery: %v", err)
+	}
+	if !entry.Deleted || !entry.VectorClock.Equal(newer) {
+		t.Fatalf("Expected recovered tombstone at %s, got deleted=%v clock=%s", newer, entry.Deleted, entry.VectorClock)
+	}
+	if applied, _, _ := recovered.WriteIf(storage.NewEntry("k", []byte("v1"), older), notSuperseded(older)); applied {
+		t.Error("Expected stale write to be refused after recovery")
+	}
+
+	// A causally newer value is accepted
+	newest := consensus.NewVectorClockFromMap(map[string]uint64{"A": 3})
+	if applied, _, _ := recovered.WriteIf(storage.NewEntry("k", []byte("v3"), newest), notSuperseded(newest)); !applied {
+		t.Error("Expected newer write to be applied")
+	}
+	if got, err := recovered.Get("k"); err != nil || string(got.Value) != "v3" {
+		t.Errorf("Expected v3 after newer write, got %v, %v", got, err)
+	}
+}

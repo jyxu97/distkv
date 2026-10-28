@@ -35,10 +35,14 @@ distkv-client -consistency=all put "critical-key" "important data"
 - `key` (string): The key to store
 - `value` (string): The value to store
 - `consistency` (optional): one, quorum, all (default: quorum)
+- `vector_clock` (optional, gRPC only): Causal context — the `vector_clock` from a previous GET or PUT of this key. The new version supersedes everything that context covers. Omit it for a blind write; the CLI always writes blind.
 
 **Response:**
 - `success` (bool): Whether operation succeeded
 - `error` (string): Error message if failed
+- `vector_clock` (object, gRPC only): The version the replicas stored for this write
+
+**Versioning:** the coordinator creates the write's version once, before replicating it: the supplied context with the coordinator's own entry advanced to a value it has never issued before (persisted in `version_counter` in the data directory, so restarts do not reuse it). Every replica stores that exact version.
 
 #### GET - Retrieve Value
 
@@ -58,7 +62,7 @@ distkv-client -consistency=one get "cache-key"
 **Response:**
 - `found` (bool): Whether key exists
 - `value` (string): The stored value (primary or first sibling)
-- `vector_clock` (object): Version information
+- `vector_clock` (object): Causal context for the next write. Without a conflict it is the value's version; with siblings it is the merge of all sibling clocks, so a PUT carrying it supersedes every sibling
 - `has_conflict` (bool): True when concurrent versions exist (Dynamo-style siblings)
 - `siblings` (array of SiblingVersion): All concurrent versions when `has_conflict` is true
 
@@ -68,7 +72,7 @@ distkv-client -consistency=one get "cache-key"
 
 **Conflict Handling:**
 
-When multiple nodes accept concurrent writes to the same key (no causal ordering between their vector clocks), the GET response preserves all versions as siblings instead of silently picking one. The client is responsible for resolving the conflict and writing back the merged value.
+When multiple nodes accept concurrent writes to the same key (no causal ordering between their vector clocks), the GET response preserves all versions as siblings instead of silently picking one. The client is responsible for resolving the conflict and writing back the merged value with the GET's `vector_clock` as context.
 
 ```bash
 # Example: conflict detected
@@ -94,6 +98,7 @@ distkv-client -consistency=all delete "sensitive-key"
 **Parameters:**
 - `key` (string): The key to delete
 - `consistency` (optional): one, quorum, all (default: quorum)
+- `vector_clock` (optional, gRPC only): Causal context, as for PUT. A delete with the context from a GET supersedes the versions that GET returned
 
 **Response:**
 - `success` (bool): Whether operation succeeded

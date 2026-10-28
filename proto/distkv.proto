@@ -48,13 +48,13 @@ message PutRequest {
   string key = 1;
   bytes value = 2;
   ConsistencyLevel consistency_level = 3;  // How strict to be about consistency
-  VectorClock vector_clock = 4;      // For conflict resolution
+  VectorClock vector_clock = 4;      // Causal context: the clock from a previous Get/Put of this key (omit for a blind write)
 }
 
 message PutResponse {
   bool success = 1;
   string error_message = 2;
-  VectorClock vector_clock = 3;
+  VectorClock vector_clock = 3;  // Version the replicas stored for this write
 }
 
 message GetRequest {
@@ -65,7 +65,7 @@ message GetRequest {
 message GetResponse {
   bytes value = 1;                          // Primary value (latest or first sibling)
   bool found = 2;
-  VectorClock vector_clock = 3;
+  VectorClock vector_clock = 3;             // Causal context covering every returned sibling; pass to the next Put
   string error_message = 4;
   repeated SiblingVersion siblings = 5;     // All concurrent versions (empty if no conflict)
   bool has_conflict = 6;                    // True when siblings > 1
@@ -79,6 +79,7 @@ message SiblingVersion {
 message DeleteRequest {
   string key = 1;
   ConsistencyLevel consistency_level = 2;
+  VectorClock vector_clock = 3;  // Causal context, as in PutRequest (omit for a blind delete)
 }
 
 message DeleteResponse {

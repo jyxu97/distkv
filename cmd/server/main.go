@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 
+	"distkv/pkg/consensus"
 	"distkv/pkg/gossip"
 	"distkv/pkg/logging"
 	"distkv/pkg/metrics"
@@ -82,6 +83,10 @@ type DistKVServer struct {
 
 	// Background repair
 	antiEntropy *replication.AntiEntropyManager
+
+	// dotCounter issues this node's entry in the vector clocks of writes it
+	// coordinates; persisted so values are never reused across restarts
+	dotCounter *consensus.DotCounter
 }
 
 // main is the entry point for the DistKV server
@@ -328,6 +333,12 @@ func NewDistKVServer(config *ServerConfig) (*DistKVServer, error) {
 		return nil, fmt.Errorf("failed to create storage engine: %v", err)
 	}
 
+	// Open the version counter used to stamp writes this node coordinates
+	dotCounter, err := consensus.OpenDotCounter(filepath.Join(config.DataDir, "version_counter"), consensus.DefaultDotReservation)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open version counter: %v", err)
+	}
+
 	// Initialize consistent hashing
 	consistentHash := partition.NewConsistentHash(config.VirtualNodes)
 
@@ -367,6 +378,7 @@ func NewDistKVServer(config *ServerConfig) (*DistKVServer, error) {
 		nodeSelector:   nodeSelector,
 		replicaClient:  replicaClient,
 		antiEntropy:    antiEntropy,
+		dotCounter:     dotCounter,
 	}, nil
 }
 

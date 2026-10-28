@@ -27,24 +27,7 @@ type DistKVServiceImpl struct {
 
 // Put stores a key-value pair using quorum replication
 func (s *DistKVServiceImpl) Put(ctx context.Context, req *proto.PutRequest) (*proto.PutResponse, error) {
-	// Convert request to internal format
-	vectorClock := convertVectorClockFromProto(req.VectorClock)
-	if vectorClock == nil {
-		// Create new vector clock if none provided
-		vectorClock = consensus.NewVectorClock()
-		vectorClock.Increment(s.server.config.NodeID)
-	}
-
-	// Create write request for quorum manager
-	writeReq := &replication.WriteRequest{
-		Key:         req.Key,
-		Value:       req.Value,
-		VectorClock: vectorClock,
-		Context:     ctx,
-	}
-
-	// Perform quorum write
-	writeResp, err := s.server.quorumManager.Write(writeReq)
+	writeResp, err := s.coordinateWrite(ctx, req.Key, req.Value, req.VectorClock)
 	if err != nil {
 		return &proto.PutResponse{
 			Success:      false,
@@ -57,6 +40,31 @@ func (s *DistKVServiceImpl) Put(ctx context.Context, req *proto.PutRequest) (*pr
 		VectorClock:  convertVectorClockToProto(writeResp.VectorClock),
 		ErrorMessage: "", // Success
 	}, nil
+}
+
+// coordinateWrite generates the version for one logical write and replicates
+// it. The version is created exactly once, here, before replication: the
+// client's causal context (empty for a blind write) with this node's entry
+// advanced to a value it has never issued before, even across restarts.
+// Replicas store that clock unchanged, and it is what the client gets back.
+// A nil value writes a tombstone.
+func (s *DistKVServiceImpl) coordinateWrite(ctx context.Context, key string, value []byte, causalContext *proto.VectorClock) (*replication.WriteResponse, error) {
+	var contextVC *consensus.VectorClock
+	if causalContext != nil {
+		contextVC = convertVectorClockFromProto(causalContext)
+	}
+
+	version, err := consensus.NewVersion(contextVC, s.server.config.NodeID, s.server.dotCounter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate version: %v", err)
+	}
+
+	return s.server.quorumManager.Write(&replication.WriteRequest{
+		Key:         key,
+		Value:       value,
+		VectorClock: version,
+		Context:     ctx,
+	})
 }
 
 // Get retrieves a value by key using quorum reads
@@ -85,32 +93,35 @@ func (s *DistKVServiceImpl) Get(ctx context.Context, req *proto.GetRequest) (*pr
 		})
 	}
 
+	// With siblings, the context returned to the client must cover all of
+	// them, so a write that resolves the conflict supersedes every sibling
+	// instead of just the one shown as the primary value.
+	causalContext := readResp.VectorClock
+	if readResp.HasConflict {
+		causalContext = consensus.NewVectorClock()
+		for _, sibling := range readResp.Siblings {
+			if sibling.VectorClock != nil {
+				causalContext.Update(sibling.VectorClock)
+			}
+		}
+	}
+
 	return &proto.GetResponse{
 		Value:        readResp.Value,
 		Found:        readResp.Found,
-		VectorClock:  convertVectorClockToProto(readResp.VectorClock),
+		VectorClock:  convertVectorClockToProto(causalContext),
 		ErrorMessage: "",
 		Siblings:     protoSiblings,
 		HasConflict:  readResp.HasConflict,
 	}, nil
 }
 
-// Delete removes a key-value pair using tombstone markers
+// Delete removes a key-value pair using tombstone markers. Like Put, the
+// tombstone's version is the client's causal context (if any) advanced once by
+// this coordinator.
 func (s *DistKVServiceImpl) Delete(ctx context.Context, req *proto.DeleteRequest) (*proto.DeleteResponse, error) {
-	// Create vector clock for this delete operation
-	vectorClock := consensus.NewVectorClock()
-	vectorClock.Increment(s.server.config.NodeID)
-
-	// Create write request with nil value (tombstone)
-	writeReq := &replication.WriteRequest{
-		Key:         req.Key,
-		Value:       nil, // nil value indicates deletion
-		VectorClock: vectorClock,
-		Context:     ctx,
-	}
-
-	// Perform quorum write
-	writeResp, err := s.server.quorumManager.Write(writeReq)
+	// A nil value indicates deletion
+	writeResp, err := s.coordinateWrite(ctx, req.Key, nil, req.VectorClock)
 	if err != nil {
 		return &proto.DeleteResponse{
 			Success:      false,
@@ -132,16 +143,11 @@ func (s *DistKVServiceImpl) BatchPut(ctx context.Context, req *proto.BatchPutReq
 	var failedKeys []string
 
 	for key, value := range req.Items {
-		// Create vector clock for this operation
-		vectorClock := consensus.NewVectorClock()
-		vectorClock.Increment(s.server.config.NodeID)
-
-		// Create individual put request
+		// Each item is its own blind write; Put generates a distinct version
 		putReq := &proto.PutRequest{
 			Key:              key,
 			Value:            value,
 			ConsistencyLevel: req.ConsistencyLevel,
-			VectorClock:      convertVectorClockToProto(vectorClock),
 		}
 
 		// Perform the put
@@ -173,8 +179,10 @@ type NodeServiceImpl struct {
 // LocalGet performs a local-only read operation (bypasses quorum)
 // This is used for inter-node replication reads to avoid infinite recursion
 func (s *NodeServiceImpl) LocalGet(ctx context.Context, req *proto.LocalGetRequest) (*proto.LocalGetResponse, error) {
-	// Read directly from local storage engine (bypass quorum manager)
-	entry, err := s.server.storageEngine.Get(req.Key)
+	// Read directly from local storage engine (bypass quorum manager). Use
+	// GetEntry so a tombstone's clock is reported: without it a delete would
+	// look clockless and lose to any stale copy of the value.
+	entry, err := s.server.storageEngine.GetEntry(req.Key)
 	if err != nil {
 		if err == storage.ErrKeyNotFound {
 			return &proto.LocalGetResponse{
@@ -204,19 +212,23 @@ func (s *NodeServiceImpl) LocalGet(ctx context.Context, req *proto.LocalGetReque
 	}, nil
 }
 
-// Replicate handles replication requests from other nodes
+// Replicate handles replication requests from other nodes. The replica stores
+// the version exactly as received — it never advances the clock itself — and
+// echoes that clock in its ACK. It refuses a version that its local entry
+// supersedes, so a delayed or duplicate message cannot roll the key back.
 func (s *NodeServiceImpl) Replicate(ctx context.Context, req *proto.ReplicateRequest) (*proto.ReplicateResponse, error) {
-	// Convert vector clock
 	vectorClock := convertVectorClockFromProto(req.VectorClock)
 
-	// Perform local storage operation
-	var err error
+	var entry *storage.Entry
 	if req.IsDelete {
-		err = s.server.storageEngine.Delete(req.Key, vectorClock)
+		entry = storage.NewDeleteEntry(req.Key, vectorClock)
 	} else {
-		err = s.server.storageEngine.Put(req.Key, req.Value, vectorClock)
+		entry = storage.NewEntry(req.Key, req.Value, vectorClock)
 	}
 
+	applied, current, err := s.server.storageEngine.WriteIf(entry, func(current *storage.Entry) bool {
+		return !replication.Supersedes(current, vectorClock, req.IsDelete)
+	})
 	if err != nil {
 		return &proto.ReplicateResponse{
 			Success:      false,
@@ -224,15 +236,18 @@ func (s *NodeServiceImpl) Replicate(ctx context.Context, req *proto.ReplicateReq
 		}, nil
 	}
 
-	// Increment a copy for the response so the stored entry is not mutated.
-	// The storage engine holds the vectorClock pointer directly; modifying it
-	// in-place would corrupt the stored vector clock for this key.
-	responseVC := vectorClock.Copy()
-	responseVC.Increment(s.server.config.NodeID)
+	if !applied {
+		return &proto.ReplicateResponse{
+			Success: false,
+			ErrorMessage: fmt.Sprintf("stale version %s: local version %s supersedes it",
+				vectorClock, current.VectorClock),
+			VectorClock: convertVectorClockToProto(current.VectorClock),
+		}, nil
+	}
 
 	return &proto.ReplicateResponse{
 		Success:     true,
-		VectorClock: convertVectorClockToProto(responseVC),
+		VectorClock: convertVectorClockToProto(vectorClock),
 	}, nil
 }
 

@@ -118,6 +118,15 @@ func (m *MockStorageEngine) Delete(key string, vectorClock *consensus.VectorCloc
 	return nil
 }
 
+func (m *MockStorageEngine) WriteIf(entry *storage.Entry, cond func(current *storage.Entry) bool) (bool, *storage.Entry, error) {
+	current := m.data[entry.Key]
+	if cond != nil && !cond(current) {
+		return false, current, nil
+	}
+	m.data[entry.Key] = entry
+	return true, current, nil
+}
+
 func (m *MockStorageEngine) Iterator() (storage.Iterator, error) {
 	entries := make([]*storage.Entry, 0, len(m.data))
 	for _, e := range m.data {
@@ -817,4 +826,101 @@ func TestWritePendingAckDoesNotReplaceNaturalAck(t *testing.T) {
 	if resp == nil || resp.Success {
 		t.Error("Expected unsuccessful write response")
 	}
+}
+
+// TestWriteReturnsReplicatedVersion verifies that a successful write returns
+// exactly the version that was replicated, and that an ACK reporting any other
+// version does not count toward W.
+func TestWriteReturnsReplicatedVersion(t *testing.T) {
+	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second,
+		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
+	replicas := []ReplicaInfo{
+		{NodeID: "node1", Address: "addr1", IsAlive: true},
+		{NodeID: "node2", Address: "addr2", IsAlive: true},
+		{NodeID: "node3", Address: "addr3", IsAlive: true},
+	}
+
+	version := consensus.NewVectorClockFromMap(map[string]uint64{"node1": 7})
+	// A replica that advanced the clock itself, as the old Replicate handler did
+	divergent := consensus.NewVectorClockFromMap(map[string]uint64{"node1": 7, "node3": 1})
+
+	t.Run("one divergent ACK still meets W=2", func(t *testing.T) {
+		selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas}
+		client := &MockReplicaClient{
+			writeResponses: map[string]*ReplicaResponse{
+				"node3": {NodeID: "node3", Success: true, VectorClock: divergent},
+			},
+			readResponses: make(map[string]*ReplicaResponse),
+		}
+		qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+		resp, err := qm.Write(&WriteRequest{Key: "k", Value: []byte("v"), VectorClock: version, Context: context.Background()})
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+		if !resp.VectorClock.Equal(version) {
+			t.Errorf("Write returned %s, want the replicated version %s", resp.VectorClock, version)
+		}
+		if resp.ReplicasWritten != 2 {
+			t.Errorf("Expected 2 matching ACKs, got %d", resp.ReplicasWritten)
+		}
+	})
+
+	t.Run("two divergent ACKs fail W=2", func(t *testing.T) {
+		selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas}
+		client := &MockReplicaClient{
+			writeResponses: map[string]*ReplicaResponse{
+				"node2": {NodeID: "node2", Success: true, VectorClock: divergent},
+				"node3": {NodeID: "node3", Success: true, VectorClock: divergent},
+			},
+			readResponses: make(map[string]*ReplicaResponse),
+		}
+		qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+		if _, err := qm.Write(&WriteRequest{Key: "k", Value: []byte("v"), VectorClock: version, Context: context.Background()}); err == nil {
+			t.Error("Expected write to fail when only one replica stored the version")
+		}
+	})
+}
+
+// TestReadRepairFillsMissingReplica verifies that a replica that does not have
+// the key at all (no clock) receives the winning version during read repair.
+func TestReadRepairFillsMissingReplica(t *testing.T) {
+	config := &QuorumConfig{N: 2, R: 2, W: 1, RequestTimeout: 5 * time.Second,
+		RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
+	replicas := []ReplicaInfo{
+		{NodeID: "node1", Address: "addr1", IsAlive: true},
+		{NodeID: "node2", Address: "addr2", IsAlive: true},
+	}
+
+	version := consensus.NewVectorClockFromMap(map[string]uint64{"node1": 3})
+	selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas}
+	client := &MockReplicaClient{
+		writeResponses: make(map[string]*ReplicaResponse),
+		readResponses: map[string]*ReplicaResponse{
+			"node1": {NodeID: "node1", Success: true, Value: []byte("v"), VectorClock: version},
+			"node2": {NodeID: "node2", Success: true}, // Key missing: no value, no clock
+		},
+	}
+	qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+	resp, err := qm.Read(&ReadRequest{Key: "k", Context: context.Background()})
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if !resp.Found || resp.HasConflict {
+		t.Fatalf("Expected a single found version, got found=%v conflict=%v", resp.Found, resp.HasConflict)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.repairCallsMu.Lock()
+		repaired := len(client.repairCallNodes) == 1 && client.repairCallNodes[0] == "node2"
+		client.repairCallsMu.Unlock()
+		if repaired {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("Expected read repair to push the winning version to node2")
 }
