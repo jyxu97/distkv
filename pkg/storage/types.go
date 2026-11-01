@@ -16,6 +16,11 @@ type Entry struct {
 	VectorClock *consensus.VectorClock // Version information for conflict resolution
 	Timestamp   int64                  // When this entry was created (Unix timestamp)
 	Deleted     bool                   // True if this is a deletion marker (tombstone)
+
+	// Purged marks a key this node dropped because it no longer replicates it.
+	// Unlike a tombstone it carries no version and never leaves this node: the
+	// key simply reads as absent locally, which loses to any real version.
+	Purged bool
 }
 
 // NewEntry creates a new entry with current timestamp.
@@ -39,6 +44,15 @@ func NewDeleteEntry(key string, vectorClock *consensus.VectorClock) *Entry {
 		VectorClock: vectorClock,
 		Timestamp:   time.Now().UnixNano(),
 		Deleted:     true,
+	}
+}
+
+// NewPurgeEntry creates a local purge marker for a key (see Entry.Purged).
+func NewPurgeEntry(key string) *Entry {
+	return &Entry{
+		Key:       key,
+		Timestamp: time.Now().UnixNano(),
+		Purged:    true,
 	}
 }
 

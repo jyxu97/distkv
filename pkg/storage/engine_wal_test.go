@@ -323,3 +323,77 @@ func TestEngine_WriteIfSeesTombstonesAndRefusesStale(t *testing.T) {
 		t.Errorf("Expected v3 after newer write, got %v, %v", got, err)
 	}
 }
+
+// TestEngine_PurgeMarker verifies the local purge marker cleanup uses: the
+// key reads as absent (no tombstone, no clock), stays absent across flush,
+// compaction and crash recovery, and a later write makes it visible again.
+func TestEngine_PurgeMarker(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	cfg := walConfig()
+	engine, err := storage.NewEngine(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	vc := consensus.NewVectorClockFromMap(map[string]uint64{"A": 1})
+	for _, key := range []string{"kept", "purged"} {
+		if err := engine.Put(key, []byte("v1"), vc); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+	}
+
+	purged, _, err := engine.WriteIf(storage.NewPurgeEntry("purged"), func(current *storage.Entry) bool {
+		return current != nil
+	})
+	if err != nil || !purged {
+		t.Fatalf("purge failed: applied=%v err=%v", purged, err)
+	}
+
+	assertAbsent := func(e *storage.Engine, when string) {
+		t.Helper()
+		if _, err := e.GetEntry("purged"); err != storage.ErrKeyNotFound {
+			t.Fatalf("%s: GetEntry(purged) err = %v, want ErrKeyNotFound", when, err)
+		}
+		it, err := e.Iterator()
+		if err != nil {
+			t.Fatalf("%s: Iterator: %v", when, err)
+		}
+		defer it.Close()
+		var keys []string
+		for ; it.Valid(); it.Next() {
+			keys = append(keys, it.Key())
+		}
+		if len(keys) != 1 || keys[0] != "kept" {
+			t.Fatalf("%s: iterator returned %v, want only [kept]", when, keys)
+		}
+	}
+	assertAbsent(engine, "after purge")
+
+	// Survives a crash: the marker is in the WAL
+	engine.CrashForTesting()
+	recovered, err := storage.NewEngine(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewEngine after crash: %v", err)
+	}
+	assertAbsent(recovered, "after crash recovery")
+
+	// Survives a clean shutdown, which flushes the marker to an SSTable
+	if err := recovered.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := storage.NewEngine(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewEngine after close: %v", err)
+	}
+	defer reopened.Close()
+	assertAbsent(reopened, "after flush to SSTable")
+
+	// A new write makes the key visible again
+	newer := consensus.NewVectorClockFromMap(map[string]uint64{"A": 2})
+	if err := reopened.Put("purged", []byte("v2"), newer); err != nil {
+		t.Fatalf("Put after purge: %v", err)
+	}
+	if entry, err := reopened.Get("purged"); err != nil || string(entry.Value) != "v2" {
+		t.Fatalf("Get after re-write = %v, %v; want v2", entry, err)
+	}
+}

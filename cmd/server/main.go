@@ -98,6 +98,8 @@ type DistKVServer struct {
 
 	stopCh   chan struct{} // Closed by Stop to end background work
 	stopOnce sync.Once
+
+	cleanupMu sync.Mutex // One cleanup run at a time
 }
 
 // rangeStreamer fetches the entries a peer holds in the given token ranges.
@@ -398,6 +400,11 @@ func NewDistKVServer(config *ServerConfig) (*DistKVServer, error) {
 		replicaClient,
 		30*time.Second,
 	)
+	// Pull only keys this node replicates, so keys it removed after handing
+	// their range to another node are not copied back
+	antiEntropy.SetOwnershipFilter(func(key string) bool {
+		return containsNode(consistentHash.GetNodes(key, config.QuorumConfig.N), config.NodeID)
+	})
 
 	return &DistKVServer{
 		config:          config,

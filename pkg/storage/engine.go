@@ -357,8 +357,19 @@ func (e *Engine) GetEntry(key string) (*Entry, error) {
 }
 
 // lookupLocked finds the newest entry for key, tombstones included, and
-// reports whether it came from a MemTable. Caller must hold e.mutex.
+// reports whether it came from a MemTable. A purge marker means the key is
+// absent. Caller must hold e.mutex.
 func (e *Engine) lookupLocked(key string) (*Entry, bool, error) {
+	entry, inMemory, err := e.lookupNewestLocked(key)
+	if err == nil && entry.Purged {
+		return nil, inMemory, ErrKeyNotFound
+	}
+	return entry, inMemory, err
+}
+
+// lookupNewestLocked returns the newest stored entry for key, purge markers
+// included. Caller must hold e.mutex.
+func (e *Engine) lookupNewestLocked(key string) (*Entry, bool, error) {
 	// First check active MemTable
 	if entry := e.activeMemTable.Get(key); entry != nil {
 		return entry, true, nil

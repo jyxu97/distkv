@@ -227,6 +227,15 @@ func (rc *ReplicaClient) StreamRange(ctx context.Context, nodeID string, ranges 
 	return entries, nil
 }
 
+// RingView asks a peer for its view of ring membership and joining nodes.
+func (rc *ReplicaClient) RingView(ctx context.Context, nodeID string) (*proto.RingViewResponse, error) {
+	client, err := rc.getNodeServiceClient(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to node %s: %v", nodeID, err)
+	}
+	return client.RingView(ctx, &proto.RingViewRequest{})
+}
+
 // UpdateNodeAddress updates the network address for a node
 // This is called when we discover nodes through gossip or configuration
 func (rc *ReplicaClient) UpdateNodeAddress(nodeID, address string) {

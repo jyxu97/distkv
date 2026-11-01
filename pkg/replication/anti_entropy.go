@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"distkv/pkg/consensus"
@@ -51,6 +52,18 @@ type AntiEntropyManager struct {
 	interval      time.Duration
 	logger        *logging.Logger
 	stopCh        chan struct{}
+	stopOnce      sync.Once
+
+	// owns reports whether this node replicates a key; nil means every key.
+	// Entries for other keys are not pulled, so a node never re-acquires keys
+	// it dropped after handing their range to another node.
+	owns func(key string) bool
+}
+
+// SetOwnershipFilter restricts which keys anti-entropy pulls from peers to
+// those for which owns returns true. Call before Start.
+func (am *AntiEntropyManager) SetOwnershipFilter(owns func(key string) bool) {
+	am.owns = owns
 }
 
 // NewAntiEntropyManager creates a new anti-entropy manager.
@@ -78,9 +91,9 @@ func (am *AntiEntropyManager) Start() {
 	am.logger.WithField("interval", am.interval).Info("Anti-entropy started")
 }
 
-// Stop halts the background goroutine.
+// Stop halts the background goroutine. It is safe to call more than once.
 func (am *AntiEntropyManager) Stop() {
-	close(am.stopCh)
+	am.stopOnce.Do(func() { close(am.stopCh) })
 }
 
 func (am *AntiEntropyManager) run() {
@@ -142,6 +155,9 @@ func (am *AntiEntropyManager) syncWithPeer(ctx context.Context, peer PeerInfo, l
 	}).Info("Anti-entropy: applying divergent entries")
 
 	for _, entry := range diffEntries {
+		if am.owns != nil && !am.owns(entry.Key) {
+			continue
+		}
 		if err := MergeEntry(am.storageEngine, entry); err != nil {
 			am.logger.WithError(err).WithField("key", entry.Key).Warn("Anti-entropy: failed to apply entry")
 		}

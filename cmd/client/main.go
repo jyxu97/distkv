@@ -102,6 +102,13 @@ func main() {
 		err = client.LocalGet(args[0])
 	case "status":
 		err = client.GetStatus()
+	case "cleanup":
+		apply := len(args) > 0 && args[0] == "apply"
+		if len(args) > 0 && !apply {
+			fmt.Println("Usage: client cleanup [apply]")
+			os.Exit(1)
+		}
+		err = client.Cleanup(!apply)
 	case "help":
 		printUsage()
 		return
@@ -392,6 +399,35 @@ func (c *DistKVClient) Close() error {
 }
 
 // printUsage prints usage information
+// Cleanup reports (dry run) or removes keys the server no longer replicates
+// after a range handoff. Only that server's local copies are affected.
+func (c *DistKVClient) Cleanup(dryRun bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer cancel()
+
+	resp, err := c.adminClient.Cleanup(ctx, &proto.CleanupRequest{DryRun: dryRun})
+	if err != nil {
+		return fmt.Errorf("cleanup failed: %v", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("cleanup refused: %s", resp.ErrorMessage)
+	}
+
+	mode := "Dry run"
+	if !dryRun {
+		mode = "Cleanup"
+	}
+	fmt.Printf("%s: scanned %d keys, %d still replicated here, %d eligible, %d removed\n",
+		mode, resp.KeysScanned, resp.KeysOwned, resp.KeysEligible, resp.KeysRemoved)
+	for reason, count := range resp.Skipped {
+		fmt.Printf("  kept %d keys: %s\n", count, reason)
+	}
+	for _, key := range resp.SampleEligibleKeys {
+		fmt.Printf("  eligible: %s\n", key)
+	}
+	return nil
+}
+
 func printUsage() {
 	fmt.Println("DistKV Client - Command line interface for DistKV")
 	fmt.Println()
@@ -410,6 +446,7 @@ func printUsage() {
 	fmt.Println("  delete <key>                Delete a key-value pair")
 	fmt.Println("  batch <k1> <v1> <k2> <v2>   Store multiple key-value pairs")
 	fmt.Println("  status                      Show cluster status")
+	fmt.Println("  cleanup [apply]             List (or with apply, remove) keys this server no longer replicates")
 	fmt.Println("  help                        Show this help message")
 	fmt.Println()
 	fmt.Println("Examples:")

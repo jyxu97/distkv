@@ -124,3 +124,36 @@ var _ StorageEngine = (*MockStorageEngine)(nil)
 
 // Ensure mockIterator satisfies storage.Iterator.
 var _ storage.Iterator = (*mockIterator)(nil)
+
+// TestAntiEntropySkipsKeysNotOwned verifies that anti-entropy only pulls keys
+// this node replicates, so a key dropped after a handoff is not re-acquired.
+func TestAntiEntropySkipsKeysNotOwned(t *testing.T) {
+	local := NewMockStorageEngine()
+
+	peerVC := consensus.NewVectorClock()
+	peerVC.Increment("node2")
+	peerClient := &mockAntiEntropyClient{
+		responses: map[string][]AntiEntropyEntry{
+			"node2": {
+				{Key: "owned", Value: []byte("v"), VectorClock: peerVC},
+				{Key: "handed-off", Value: []byte("v"), VectorClock: peerVC},
+			},
+		},
+	}
+
+	mgr := NewAntiEntropyManager("node1", local,
+		&mockPeerProvider{peers: []PeerInfo{{NodeID: "node2"}}}, peerClient, 1*time.Hour)
+	mgr.SetOwnershipFilter(func(key string) bool { return key == "owned" })
+	mgr.runRound()
+
+	if entry, _ := local.Get("owned"); entry == nil {
+		t.Error("Expected the owned key to be pulled")
+	}
+	if entry, _ := local.Get("handed-off"); entry != nil {
+		t.Error("Anti-entropy pulled a key this node does not replicate")
+	}
+
+	// Stop is safe to call twice
+	mgr.Stop()
+	mgr.Stop()
+}

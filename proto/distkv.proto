@@ -18,6 +18,7 @@ service NodeService {
   rpc LocalGet(LocalGetRequest) returns (LocalGetResponse);
   rpc AntiEntropy(AntiEntropyRequest) returns (AntiEntropyResponse);
   rpc StreamRange(StreamRangeRequest) returns (StreamRangeResponse);
+  rpc RingView(RingViewRequest) returns (RingViewResponse);
   rpc Gossip(GossipMessage) returns (GossipResponse);
   rpc Handoff(HandoffRequest) returns (HandoffResponse);
 }
@@ -29,6 +30,7 @@ service AdminService {
   rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
   rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
   rpc GetKeyOwnership(KeyOwnershipRequest) returns (KeyOwnershipResponse);
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
 }
 
 // Consistency levels
@@ -164,6 +166,16 @@ message StreamRangeResponse {
   repeated KeyValue entries = 1;
 }
 
+// A node's view of ring ownership, used to confirm views have converged
+// before dropping keys a node no longer replicates
+message RingViewRequest {}
+
+message RingViewResponse {
+  repeated string members = 1;  // Nodes on this node's hash ring, sorted
+  repeated string joining = 2;  // Members this node sees as still joining
+  bool ready = 3;               // This node has finished bootstrapping
+}
+
 // Gossip protocol messages
 message NodeInfo {
   string node_id = 1;
@@ -277,4 +289,20 @@ message KeyOwnershipRequest {
 message KeyOwnershipResponse {
   string key = 1;
   repeated string nodes = 2;
+}
+
+// Local cleanup of keys this node no longer replicates after a handoff
+message CleanupRequest {
+  bool dry_run = 1;  // Report eligible keys without removing anything
+}
+
+message CleanupResponse {
+  bool success = 1;
+  string error_message = 2;      // Why cleanup was refused, if it was
+  int64 keys_scanned = 3;        // Local keys examined
+  int64 keys_owned = 4;          // Keys this node still replicates (never removed)
+  int64 keys_eligible = 5;       // Keys safe to remove
+  int64 keys_removed = 6;        // Keys actually removed (0 in a dry run)
+  repeated string sample_eligible_keys = 7;  // Up to 100 eligible keys
+  map<string, int64> skipped = 8;            // Reason -> count of keys kept
 }

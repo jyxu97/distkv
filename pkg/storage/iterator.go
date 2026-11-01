@@ -345,9 +345,22 @@ func NewEngineIterator(engine *Engine) (*EngineIterator, error) {
 		return nil, fmt.Errorf("no data sources available for iteration")
 	}
 
-	return &EngineIterator{
+	ei := &EngineIterator{
 		mergeIterator: NewMergeIterator(iterators),
-	}, nil
+	}
+	ei.skipPurged()
+	return ei, nil
+}
+
+// skipPurged advances past keys whose newest entry is a purge marker: they
+// are absent from this node's point of view.
+func (ei *EngineIterator) skipPurged() {
+	for ei.mergeIterator.Valid() {
+		if entry := ei.mergeIterator.Value(); entry == nil || !entry.Purged {
+			return
+		}
+		ei.mergeIterator.Next()
+	}
 }
 
 // Valid returns true if the iterator points to a valid entry.
@@ -368,6 +381,7 @@ func (ei *EngineIterator) Value() *Entry {
 // Next advances the iterator to the next entry.
 func (ei *EngineIterator) Next() {
 	ei.mergeIterator.Next()
+	ei.skipPurged()
 }
 
 // Close releases resources held by the iterator.

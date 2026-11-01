@@ -51,6 +51,38 @@ This guide covers operational aspects of running DistKV in production.
 # Should show 4 nodes
 ```
 
+### Cleaning Up After Adding a Node
+
+After a node joins, the nodes that handed ranges to it keep their copies.
+`cleanup` removes those copies from one server's local storage. It never
+issues a delete to the cluster.
+
+```bash
+# Report what would be removed (default: dry run)
+./distkv-client -server=10.0.1.10:8080 cleanup
+
+# Remove it
+./distkv-client -server=10.0.1.10:8080 cleanup apply
+```
+
+Run it on each previous owner. A key is removed only if all of these hold:
+
+1. The server has finished bootstrapping, no node is joining, and every ring
+   member confirms the same membership. Otherwise cleanup is refused with the
+   reason (for example `nodes still joining`, or `cannot confirm ring view of
+   node3` when a member is down).
+2. The server is not one of the key's N replicas any more.
+3. Each of the key's N replicas holds an equal or newer version, deletes
+   included. Keys that fail this are kept and counted by reason:
+   `replica_unreachable`, `replica_missing`, `replica_older`,
+   `replica_concurrent`.
+4. The local copy has not changed since it was verified (`changed_locally`
+   otherwise).
+
+Removal writes a local marker through the WAL, so it survives restarts.
+Kept keys are safe to retry later, for example after anti-entropy or read
+repair has brought the replicas up to date.
+
 ### Removing Nodes
 
 1. **Graceful shutdown**:

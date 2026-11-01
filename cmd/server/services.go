@@ -331,6 +331,17 @@ func (s *NodeServiceImpl) StreamRange(ctx context.Context, req *proto.StreamRang
 	return &proto.StreamRangeResponse{Entries: entries}, nil
 }
 
+// RingView reports this node's ring membership and which members it sees as
+// joining, so a node about to remove keys can confirm views have converged.
+func (s *NodeServiceImpl) RingView(ctx context.Context, req *proto.RingViewRequest) (*proto.RingViewResponse, error) {
+	members, joining := s.server.localRingView()
+	return &proto.RingViewResponse{
+		Members: members,
+		Joining: joining,
+		Ready:   s.server.isReady(),
+	}, nil
+}
+
 // Gossip handles gossip protocol messages
 func (s *NodeServiceImpl) Gossip(ctx context.Context, req *proto.GossipMessage) (*proto.GossipResponse, error) {
 	// Convert proto node info to internal format
@@ -477,6 +488,14 @@ func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *proto.Clus
 			Qps:           0, // Placeholder - would need to calculate QPS
 		},
 	}, nil
+}
+
+// Cleanup removes, or with dry_run only reports, local keys this node no
+// longer replicates and whose current replicas all hold an equal or newer
+// version. It refuses to run until ring ownership has converged.
+func (s *AdminServiceImpl) Cleanup(ctx context.Context, req *proto.CleanupRequest) (*proto.CleanupResponse, error) {
+	report, err := s.server.cleanup(ctx, req.DryRun)
+	return cleanupResponse(report, err), nil
 }
 
 func (s *AdminServiceImpl) GetKeyOwnership(ctx context.Context, req *proto.KeyOwnershipRequest) (*proto.KeyOwnershipResponse, error) {

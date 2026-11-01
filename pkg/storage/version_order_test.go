@@ -125,6 +125,36 @@ func TestParseSSTableGen(t *testing.T) {
 	}
 }
 
+// TestCompactionKeepsPurgeMarker covers a purge marker in a newer SSTable than
+// the value it hides: compaction must keep the marker, so the key stays absent.
+func TestCompactionKeepsPurgeMarker(t *testing.T) {
+	for _, strategy := range []CompactionStrategy{CompactionSimple, CompactionLevelBased} {
+		t.Run(fmt.Sprintf("strategy=%d", strategy), func(t *testing.T) {
+			e := versionOrderEngine(t, filepath.Join(t.TempDir(), "data"), strategy)
+			defer e.Close()
+
+			writeRounds(t, e, 10, 3)
+			if _, _, err := e.WriteIf(NewPurgeEntry("key-03"), nil); err != nil {
+				t.Fatalf("purge: %v", err)
+			}
+			writeRounds(t, e, 1, 1) // More tables after the marker
+
+			e.config.CompactionThreshold = 4
+			e.performCompaction()
+			if _, err := e.GetEntry("key-03"); err != ErrKeyNotFound {
+				t.Fatalf("purged key visible after compaction: err=%v", err)
+			}
+			it, _ := e.Iterator()
+			defer it.Close()
+			for ; it.Valid(); it.Next() {
+				if it.Key() == "key-03" {
+					t.Fatal("iterator returned the purged key after compaction")
+				}
+			}
+		})
+	}
+}
+
 // TestIteratorMergesUnsortedMemTable covers the active MemTable as a merge
 // source: it stores keys in insertion order, but the merge iterator needs
 // every source in key order to return each key once with its newest version.
