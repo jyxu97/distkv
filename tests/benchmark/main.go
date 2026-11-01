@@ -24,6 +24,8 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,10 +37,12 @@ import (
 )
 
 const (
-	numKeys       = 1_000
-	valueSize     = 64
-	benchDuration = 5 * time.Second
+	numKeys   = 1_000
+	valueSize = 64
 )
+
+// benchDuration is how long each concurrency level runs (-duration).
+var benchDuration = 5 * time.Second
 
 func main() {
 	server := flag.String("server", "localhost:8080", "DistKV server address")
@@ -46,7 +50,24 @@ func main() {
 	replicas := flag.Int("replicas", 3, "Replication factor (N)")
 	readQuorum := flag.Int("read-quorum", 2, "Read quorum (R)")
 	writeQuorum := flag.Int("write-quorum", 2, "Write quorum (W)")
+	duration := flag.Duration("duration", benchDuration, "How long to run each concurrency level")
+	mode := flag.String("mode", "all", "Phases to run: all, read (read-only), or mixed (50/50)")
+	levelsFlag := flag.String("concurrency", "10,25,50,100,150,200", "Comma-separated concurrency levels to run")
 	flag.Parse()
+	var levels []int
+	for _, field := range strings.Split(*levelsFlag, ",") {
+		level, err := strconv.Atoi(strings.TrimSpace(field))
+		if err != nil || level <= 0 {
+			fmt.Fprintf(os.Stderr, "invalid -concurrency %q\n", *levelsFlag)
+			os.Exit(1)
+		}
+		levels = append(levels, level)
+	}
+	benchDuration = *duration
+	if *mode != "all" && *mode != "read" && *mode != "mixed" {
+		fmt.Fprintf(os.Stderr, "invalid -mode %q: want all, read or mixed\n", *mode)
+		os.Exit(1)
+	}
 
 	conn, err := grpc.Dial(*server, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -56,8 +77,8 @@ func main() {
 	defer conn.Close()
 	client := proto.NewDistKVClient(conn)
 
-	fmt.Printf("Cluster: %d nodes  |  N=%d R=%d W=%d\n\n",
-		*clusterSize, *replicas, *readQuorum, *writeQuorum)
+	fmt.Printf("Cluster: %d nodes  |  N=%d R=%d W=%d  |  %s per level\n\n",
+		*clusterSize, *replicas, *readQuorum, *writeQuorum, benchDuration)
 
 	// Pre-load keys
 	fmt.Printf("Pre-loading %d keys into %s...\n", numKeys, *server)
@@ -69,41 +90,45 @@ func main() {
 	divider := fmt.Sprintf("%-12s %-12s %-10s %-10s %-10s %-10s",
 		"───────────", "───────────", "────────", "────────", "────────", "────────")
 
-	// Phase 1: read-only
-	fmt.Println("\n=== Phase 1: Read-only ===")
-	fmt.Println(header)
-	fmt.Println(divider)
-	readMaxQPS := 0.0
-	for _, c := range []int{10, 25, 50, 100, 150, 200} {
-		qps, p50, p95, p99, errRate := runBenchmark(client, c, 1.0)
-		marker := ""
-		if p99 > 10 {
-			marker = "  ← p99>10ms"
-		} else {
-			readMaxQPS = qps
+	if *mode != "mixed" {
+		// Phase 1: read-only
+		fmt.Println("\n=== Phase 1: Read-only ===")
+		fmt.Println(header)
+		fmt.Println(divider)
+		readMaxQPS := 0.0
+		for _, c := range levels {
+			qps, p50, p95, p99, errRate := runBenchmark(client, c, 1.0)
+			marker := ""
+			if p99 > 10 {
+				marker = "  ← p99>10ms"
+			} else {
+				readMaxQPS = qps
+			}
+			fmt.Printf("%-12d %-12.0f %-10.2f %-10.2f %-10.2f %-10.2f%s\n",
+				c, qps, p50, p95, p99, errRate, marker)
 		}
-		fmt.Printf("%-12d %-12.0f %-10.2f %-10.2f %-10.2f %-10.2f%s\n",
-			c, qps, p50, p95, p99, errRate, marker)
+		fmt.Printf("\nPeak read QPS (p99<10ms): %.0f\n", readMaxQPS)
 	}
-	fmt.Printf("\nPeak read QPS (p99<10ms): %.0f\n", readMaxQPS)
 
-	// Phase 2: mixed 50/50
-	fmt.Println("\n=== Phase 2: Mixed read/write (50/50) ===")
-	fmt.Println(header)
-	fmt.Println(divider)
-	mixedMaxQPS := 0.0
-	for _, c := range []int{10, 25, 50, 100, 150, 200} {
-		qps, p50, p95, p99, errRate := runBenchmark(client, c, 0.5)
-		marker := ""
-		if p99 > 10 {
-			marker = "  ← p99>10ms"
-		} else {
-			mixedMaxQPS = qps
+	if *mode != "read" {
+		// Phase 2: mixed 50/50
+		fmt.Println("\n=== Phase 2: Mixed read/write (50/50) ===")
+		fmt.Println(header)
+		fmt.Println(divider)
+		mixedMaxQPS := 0.0
+		for _, c := range levels {
+			qps, p50, p95, p99, errRate := runBenchmark(client, c, 0.5)
+			marker := ""
+			if p99 > 10 {
+				marker = "  ← p99>10ms"
+			} else {
+				mixedMaxQPS = qps
+			}
+			fmt.Printf("%-12d %-12.0f %-10.2f %-10.2f %-10.2f %-10.2f%s\n",
+				c, qps, p50, p95, p99, errRate, marker)
 		}
-		fmt.Printf("%-12d %-12.0f %-10.2f %-10.2f %-10.2f %-10.2f%s\n",
-			c, qps, p50, p95, p99, errRate, marker)
+		fmt.Printf("\nPeak mixed QPS (p99<10ms): %.0f\n", mixedMaxQPS)
 	}
-	fmt.Printf("\nPeak mixed QPS (p99<10ms): %.0f\n", mixedMaxQPS)
 }
 
 // preload writes numKeys random key-value pairs into the cluster.
