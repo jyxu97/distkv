@@ -152,10 +152,16 @@ func (am *AntiEntropyManager) syncWithPeer(ctx context.Context, peer PeerInfo, l
 // locally or the entry is causally newer than the local entry (tombstones
 // included, so a stale value cannot resurrect a delete). Concurrent versions
 // (siblings) are skipped — read repair and application merge handle those.
-// The check and the write are atomic with respect to other local writers.
+// A deleted entry is written as a tombstone. The check and the write are
+// atomic with respect to other local writers.
 func MergeEntry(storageEngine StorageEngine, entry AntiEntropyEntry) error {
+	incoming := storage.NewEntry(entry.Key, entry.Value, entry.VectorClock)
+	if entry.IsDeleted {
+		incoming = storage.NewDeleteEntry(entry.Key, entry.VectorClock)
+	}
+
 	_, _, err := storageEngine.WriteIf(
-		storage.NewEntry(entry.Key, entry.Value, entry.VectorClock),
+		incoming,
 		func(current *storage.Entry) bool {
 			if current == nil {
 				return true

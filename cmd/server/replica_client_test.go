@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"distkv/pkg/consensus"
 )
 
@@ -272,4 +275,30 @@ func TestReplicaResponseStructure(t *testing.T) {
 	_ = readResp.Error
 	_ = readResp.Value
 	_ = readResp.VectorClock
+}
+
+// TestUpdateNodeAddressKeepsConnectionForSameAddress tests that re-announcing a
+// node at the same address does not close its connection, which would fail
+// RPCs in flight on it.
+func TestUpdateNodeAddressKeepsConnectionForSameAddress(t *testing.T) {
+	rc := NewReplicaClient()
+	rc.UpdateNodeAddress("node1", "localhost:8080")
+
+	// A non-blocking dial gives a real connection object without a server
+	conn, err := grpc.Dial("localhost:8080", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+	rc.connections["node1"] = conn
+
+	rc.UpdateNodeAddress("node1", "localhost:8080")
+	if rc.connections["node1"] != conn {
+		t.Fatal("Connection was dropped although the address did not change")
+	}
+
+	rc.UpdateNodeAddress("node1", "localhost:8081")
+	if _, exists := rc.connections["node1"]; exists {
+		t.Error("Connection should be dropped when the address changes")
+	}
 }

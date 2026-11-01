@@ -290,9 +290,11 @@ func (s *NodeServiceImpl) AntiEntropy(ctx context.Context, req *proto.AntiEntrop
 	return &proto.AntiEntropyResponse{MissingKeys: entries}, nil
 }
 
-// StreamRange returns every live entry whose ring hash falls in one of the
+// StreamRange returns every entry whose ring hash falls in one of the
 // requested token ranges. A joining node calls this on each peer to bootstrap
-// the ranges it is taking over. Tombstones are skipped, as in AntiEntropy.
+// the ranges it is taking over. Tombstones are included: a joining node that
+// received a stale value from one peer but no tombstone from the others would
+// otherwise resurrect the deleted key.
 func (s *NodeServiceImpl) StreamRange(ctx context.Context, req *proto.StreamRangeRequest) (*proto.StreamRangeResponse, error) {
 	ranges := make([]partition.TokenRange, len(req.Ranges))
 	for i, r := range req.Ranges {
@@ -308,7 +310,7 @@ func (s *NodeServiceImpl) StreamRange(ctx context.Context, req *proto.StreamRang
 	var entries []*proto.KeyValue
 	for ; iter.Valid(); iter.Next() {
 		entry := iter.Value()
-		if entry == nil || entry.Deleted {
+		if entry == nil {
 			continue
 		}
 
@@ -319,6 +321,7 @@ func (s *NodeServiceImpl) StreamRange(ctx context.Context, req *proto.StreamRang
 					Key:         entry.Key,
 					Value:       entry.Value,
 					VectorClock: convertVectorClockToProto(entry.VectorClock),
+					IsDeleted:   entry.Deleted,
 				})
 				break
 			}

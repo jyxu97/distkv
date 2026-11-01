@@ -567,3 +567,52 @@ func TestTokenRangeContainsWrap(t *testing.T) {
 		}
 	}
 }
+
+// TestBootstrapSources tests that each segment a joining node takes over lists
+// the replicas that owned it before the node (and other unavailable nodes)
+// were on the ring
+func TestBootstrapSources(t *testing.T) {
+	ch := NewConsistentHash(50)
+	without := NewConsistentHash(50)
+	for _, node := range []string{"node1", "node2", "node3", "node4", "joiner"} {
+		ch.AddNode(node)
+		if node != "joiner" && node != "node4" {
+			without.AddNode(node)
+		}
+	}
+	unavailable := func(nodeID string) bool { return nodeID == "node4" }
+
+	plan := ch.BootstrapSources("joiner", 3, unavailable)
+	if len(plan) == 0 {
+		t.Fatal("Expected the joiner to take over some segments")
+	}
+
+	// Every key the joiner owns falls in exactly one planned segment, whose
+	// sources are the key's replicas on the ring without joiner and node4
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		owned := false
+		for _, id := range ch.GetNodes(key, 3) {
+			owned = owned || id == "joiner"
+		}
+
+		var matches []RangeSources
+		for _, segment := range plan {
+			if segment.Range.Contains(ch.HashKey(key)) {
+				matches = append(matches, segment)
+			}
+		}
+		if !owned {
+			if len(matches) != 0 {
+				t.Fatalf("key %s is not the joiner's but falls in a planned segment", key)
+			}
+			continue
+		}
+		if len(matches) != 1 {
+			t.Fatalf("key %s falls in %d planned segments, want 1", key, len(matches))
+		}
+		if got, want := fmt.Sprint(matches[0].Sources), fmt.Sprint(without.GetNodes(key, 3)); got != want {
+			t.Fatalf("key %s: sources %s, want %s", key, got, want)
+		}
+	}
+}

@@ -276,6 +276,55 @@ func (ch *ConsistentHash) TokenRangesFor(nodeID string, count int) []TokenRange 
 	return ranges
 }
 
+// RangeSources is one ring segment a node is taking over, together with the
+// replicas that held it before the node joined.
+type RangeSources struct {
+	Range   TokenRange
+	Sources []string
+}
+
+// BootstrapSources returns, for every segment nodeID must store with
+// replication factor count, the replicas that own that segment when nodeID and
+// any node for which unavailable returns true are left out of the ring. These
+// are the nodes a joining node must stream the segment from.
+func (ch *ConsistentHash) BootstrapSources(nodeID string, count int, unavailable func(nodeID string) bool) []RangeSources {
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+
+	n := len(ch.sortedKeys)
+	if n == 0 || !ch.nodes[nodeID] {
+		return nil
+	}
+
+	skip := func(id string) bool {
+		return id == nodeID || (unavailable != nil && unavailable(id))
+	}
+
+	var result []RangeSources
+	for i := 0; i < n; i++ {
+		start := ch.sortedKeys[(i-1+n)%n]
+		end := ch.sortedKeys[i]
+		if start == end && n > 1 {
+			continue // Duplicate token from a hash collision; empty segment
+		}
+
+		owned := false
+		for _, id := range ch.walkLocked(i, count, nil) {
+			if id == nodeID {
+				owned = true
+				break
+			}
+		}
+		if owned {
+			result = append(result, RangeSources{
+				Range:   TokenRange{Start: start, End: end},
+				Sources: ch.walkLocked(i, count, skip),
+			})
+		}
+	}
+	return result
+}
+
 // GetAllNodes returns all nodes currently in the hash ring.
 func (ch *ConsistentHash) GetAllNodes() []string {
 	ch.mu.RLock()

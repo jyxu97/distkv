@@ -98,7 +98,7 @@ make stop-cluster
 - **Replication**: Quorum-based consensus (default: N=3, R=2, W=2)
 - **Conflict Resolution**: Vector clocks with Dynamo-style sibling preservation
 - **Read Repair**: Coordinator detects stale replicas during quorum reads and pushes updates asynchronously
-- **Scale-Out**: A joining node is flagged `joining` in gossip and bootstraps before serving reads: peers send it writes for its new token ranges as a pending replica (required acks become W + pending), while it streams those ranges from every peer. Previous owners keep their copies (no cleanup after hand-off)
+- **Scale-Out**: A joining node is flagged `joining` in gossip and bootstraps before serving reads: peers send it writes for its new token ranges as a pending replica (required acks become W + pending), while it streams those ranges, tombstones included, from their previous replicas. It becomes readable only once every range has a complete stream from N − W + 1 previous replicas (enough to intersect every write quorum); otherwise it stays joining and retries with backoff. Previous owners keep their copies (no cleanup after hand-off)
 - **Anti-Entropy**: 30-second background sync; nodes exchange a hash of all local entries and apply missing or causally newer keys
 - **Failure Detection**: Gossip protocol with heartbeat monitoring
 - **Communication**: gRPC with Protocol Buffers

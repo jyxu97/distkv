@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,6 +89,34 @@ type DistKVServer struct {
 	// dotCounter issues this node's entry in the vector clocks of writes it
 	// coordinates; persisted so values are never reused across restarts
 	dotCounter *consensus.DotCounter
+
+	// Bootstrap of a node joining an existing cluster. rangeStreamer is the
+	// replica client; tests replace it to inject streaming faults.
+	rangeStreamer   rangeStreamer
+	bootstrapTiming bootstrapTiming
+	bootstrapDone   chan struct{} // Closed once the node serves reads
+
+	stopCh   chan struct{} // Closed by Stop to end background work
+	stopOnce sync.Once
+}
+
+// rangeStreamer fetches the entries a peer holds in the given token ranges.
+type rangeStreamer interface {
+	StreamRange(ctx context.Context, nodeID string, ranges []partition.TokenRange) ([]replication.AntiEntropyEntry, error)
+}
+
+// bootstrapTiming bounds each bootstrap attempt and the backoff between attempts.
+type bootstrapTiming struct {
+	PeerTimeout time.Duration // Limit for streaming from one peer
+	RetryBase   time.Duration // Wait after the first failed attempt
+	RetryMax    time.Duration // Cap on the exponential backoff
+}
+
+// defaultBootstrapTiming is used outside tests.
+var defaultBootstrapTiming = bootstrapTiming{
+	PeerTimeout: 60 * time.Second,
+	RetryBase:   1 * time.Second,
+	RetryMax:    30 * time.Second,
 }
 
 // main is the entry point for the DistKV server
@@ -370,15 +400,19 @@ func NewDistKVServer(config *ServerConfig) (*DistKVServer, error) {
 	)
 
 	return &DistKVServer{
-		config:         config,
-		storageEngine:  storageEngine,
-		consistentHash: consistentHash,
-		quorumManager:  quorumManager,
-		gossipManager:  gossipManager,
-		nodeSelector:   nodeSelector,
-		replicaClient:  replicaClient,
-		antiEntropy:    antiEntropy,
-		dotCounter:     dotCounter,
+		config:          config,
+		storageEngine:   storageEngine,
+		consistentHash:  consistentHash,
+		quorumManager:   quorumManager,
+		gossipManager:   gossipManager,
+		nodeSelector:    nodeSelector,
+		replicaClient:   replicaClient,
+		antiEntropy:     antiEntropy,
+		dotCounter:      dotCounter,
+		rangeStreamer:   replicaClient,
+		bootstrapTiming: defaultBootstrapTiming,
+		bootstrapDone:   make(chan struct{}),
+		stopCh:          make(chan struct{}),
 	}, nil
 }
 
@@ -448,14 +482,17 @@ func (s *DistKVServer) Start() error {
 		return fmt.Errorf("failed to start gRPC server: %v", err)
 	}
 
-	// Join cluster by connecting to seed nodes
-	if err := s.joinCluster(); err != nil {
-		logger.WithError(err).Warn("Failed to join cluster, operating as single-node")
-		// Continue anyway - we can operate as a single-node cluster
-	}
-
 	if joining {
-		s.bootstrap()
+		// Join and bootstrap in the background. The node accepts requests as a
+		// coordinator meanwhile, but stays excluded from reads until bootstrap
+		// succeeds; if it never does, the node stays joining rather than
+		// serving reads from incomplete data.
+		go s.runBootstrap()
+	} else {
+		if err := s.joinCluster(); err != nil {
+			return fmt.Errorf("failed to initialize single-node cluster: %v", err)
+		}
+		close(s.bootstrapDone)
 	}
 
 	// Start anti-entropy background repair
@@ -472,6 +509,9 @@ func (s *DistKVServer) Stop() error {
 	logger.Info("Initiating graceful shutdown")
 
 	var shutdownErrors []error
+
+	// End the bootstrap loop if it is still running
+	s.stopOnce.Do(func() { close(s.stopCh) })
 
 	// Stop anti-entropy background repair
 	if s.antiEntropy != nil {
@@ -540,7 +580,10 @@ func (s *DistKVServer) Stop() error {
 	return nil
 }
 
-// joinCluster attempts to join the cluster by contacting seed nodes
+// joinCluster attempts to join the cluster by contacting seed nodes. It fails
+// if no seed is reachable or if any node a seed reports alive could not be
+// told about us: such a node would keep coordinating writes without sending
+// them to us, so data we stream from its replicas could miss them.
 func (s *DistKVServer) joinCluster() error {
 	logger := logging.WithComponent("server.cluster")
 
@@ -555,122 +598,234 @@ func (s *DistKVServer) joinCluster() error {
 		Info("Attempting to join cluster via seed nodes")
 
 	// Try to contact each seed node to get cluster membership
-	var discoveredNodes []string
+	var members []*proto.NodeStatusInfo
+	var lastErr error
 	for _, seedAddress := range s.config.SeedNodes {
 		nodes, err := s.contactSeedNode(seedAddress)
 		if err != nil {
+			lastErr = err
 			logger.WithError(err).WithField("seedAddress", seedAddress).
 				Warn("Failed to contact seed node")
 			continue
 		}
-		discoveredNodes = append(discoveredNodes, nodes...)
+		members = append(members, nodes...)
+	}
+	if len(members) == 0 {
+		return fmt.Errorf("no seed node reachable: %v", lastErr)
 	}
 
 	// Add discovered nodes to our systems
-	for _, nodeInfo := range discoveredNodes {
-		// Parse nodeInfo format: "nodeID@address"
-		parts := strings.Split(nodeInfo, "@")
-		if len(parts) != 2 {
+	for _, member := range members {
+		if member.NodeId == s.config.NodeID {
 			continue
 		}
-		nodeID, address := parts[0], parts[1]
 
 		// Add to gossip manager
-		s.gossipManager.AddNode(nodeID, address)
+		s.gossipManager.AddNode(member.NodeId, member.Address)
 
 		// Add to consistent hash ring
-		s.consistentHash.AddNode(nodeID)
+		s.consistentHash.AddNode(member.NodeId)
 
 		// Update replica client with node address
-		s.replicaClient.UpdateNodeAddress(nodeID, address)
+		s.replicaClient.UpdateNodeAddress(member.NodeId, member.Address)
 
 		logger.WithFields(map[string]interface{}{
-			"nodeID":  nodeID,
-			"address": address,
+			"nodeID":  member.NodeId,
+			"address": member.Address,
 		}).Debug("Discovered and added node")
 	}
 
 	// Also add self to replica client for local operations
 	s.replicaClient.UpdateNodeAddress(s.config.NodeID, s.config.AdvertiseAddress)
 
-	// Announce ourselves to every known node, not just the seeds. Each peer adds
-	// us to its ring before replying, so once this loop finishes their writes
-	// already include us and we can safely snapshot their data in bootstrap.
-	announceTargets := append([]string{}, s.config.SeedNodes...)
-	for _, nodeInfo := range discoveredNodes {
-		parts := strings.Split(nodeInfo, "@")
-		if len(parts) == 2 && parts[0] != s.config.NodeID {
-			announceTargets = append(announceTargets, parts[1])
-		}
-	}
+	// Announce ourselves to every live member, not just the seeds. Each peer
+	// adds us to its ring before replying, so once every announce succeeds,
+	// their writes already include us and we can snapshot their data.
 	announced := make(map[string]bool)
-	for _, address := range announceTargets {
-		if announced[address] {
+	var unannounced []string
+	for _, member := range members {
+		if member.NodeId == s.config.NodeID || member.Status != proto.NodeStatus_ALIVE || announced[member.Address] {
 			continue
 		}
-		announced[address] = true
-		if err := s.announceSelfToNode(address); err != nil {
-			logger.WithError(err).WithField("address", address).
+		announced[member.Address] = true
+		if err := s.announceSelfToNode(member.Address); err != nil {
+			unannounced = append(unannounced, member.NodeId)
+			logger.WithError(err).WithField("nodeID", member.NodeId).
 				Warn("Failed to announce to node")
 		}
 	}
+	// Seed addresses may be aliases of members already announced; best effort
+	for _, seedAddress := range s.config.SeedNodes {
+		if !announced[seedAddress] {
+			announced[seedAddress] = true
+			_ = s.announceSelfToNode(seedAddress)
+		}
+	}
+	if len(unannounced) > 0 {
+		return fmt.Errorf("could not announce to live nodes %v", unannounced)
+	}
 
-	logger.WithField("nodeCount", len(discoveredNodes)+1).
+	logger.WithField("nodeCount", len(announced)+1).
 		Info("Successfully joined cluster")
 	return nil
 }
 
-// bootstrap streams the token ranges this node now owns from its peers, then
-// clears the joining flag so the node starts serving reads. While it runs,
-// peers already send us writes for these ranges (as a pending replica), so
-// nothing written during the stream is lost.
-func (s *DistKVServer) bootstrap() {
+// runBootstrap joins the cluster and streams this node's ranges, retrying
+// with capped exponential backoff until an attempt fully succeeds or the
+// server stops. Only a successful attempt clears the joining flag; until then
+// the node receives writes for its ranges but serves no reads.
+func (s *DistKVServer) runBootstrap() {
 	logger := logging.WithComponent("server.bootstrap")
-	defer s.gossipManager.SetLocalJoining(false)
 
-	ranges := s.consistentHash.TokenRangesFor(s.config.NodeID, s.config.QuorumConfig.N)
-	if len(ranges) == 0 {
-		return
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-s.stopCh
+		cancel()
+	}()
+
+	backoff := s.bootstrapTiming.RetryBase
+	for attempt := 1; ; attempt++ {
+		err := s.joinCluster()
+		if err == nil {
+			err = s.bootstrap(ctx)
+		}
+		if err == nil {
+			s.gossipManager.SetLocalJoining(false)
+			close(s.bootstrapDone)
+			logger.WithField("attempt", attempt).Info("Bootstrap complete, serving reads")
+			return
+		}
+
+		logger.WithError(err).WithFields(map[string]interface{}{
+			"attempt": attempt,
+			"retryIn": backoff.String(),
+		}).Warn("Bootstrap attempt failed; node stays joining and serves no reads")
+
+		select {
+		case <-ctx.Done():
+			logger.Info("Bootstrap stopped before completing; node never served reads")
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > s.bootstrapTiming.RetryMax {
+			backoff = s.bootstrapTiming.RetryMax
+		}
+	}
+}
+
+// bootstrap streams the token ranges this node now owns from their previous
+// replicas and reports whether the transfer is complete enough to serve reads.
+//
+// A write acknowledged before we joined is on at least W of a range's previous
+// replicas. Streaming from any (previous replicas - W + 1) of them therefore
+// intersects every such write quorum, so each range needs that many successful
+// sources. A source counts only if its whole stream was received and every
+// entry applied. Writes made after we joined reach us directly as a pending
+// replica, and merging by vector clock never lets an older streamed version
+// overwrite them.
+func (s *DistKVServer) bootstrap(ctx context.Context) error {
+	logger := logging.WithComponent("server.bootstrap")
+
+	gossipView := s.gossipManager.GetNodes()
+	isJoining := func(nodeID string) bool {
+		nodeInfo, exists := gossipView[nodeID]
+		return exists && nodeInfo.IsJoining()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	n, w := s.config.QuorumConfig.N, s.config.QuorumConfig.W
+	plan := s.consistentHash.BootstrapSources(s.config.NodeID, n, isJoining)
+	ranges := s.consistentHash.TokenRangesFor(s.config.NodeID, n)
+	if len(plan) == 0 || len(ranges) == 0 {
+		return fmt.Errorf("node %s owns no ranges on the ring", s.config.NodeID)
+	}
 
-	// Pull from every readable peer rather than only the previous owners: each
-	// filters by our ranges, and merging by vector clock keeps the newest
-	// version even if one replica is stale.
-	var streamed, failedPeers int
-	for _, peer := range s.gossipManager.GetAliveNodes() {
-		if peer.NodeID == s.config.NodeID || peer.Joining {
-			continue
+	var peers []string
+	seen := make(map[string]bool)
+	for _, segment := range plan {
+		if len(segment.Sources) == 0 {
+			return fmt.Errorf("range %v has no readable previous replica to stream from", segment.Range)
 		}
-
-		entries, err := s.replicaClient.StreamRange(ctx, peer.NodeID, ranges)
-		if err != nil {
-			failedPeers++
-			logger.WithError(err).WithField("peer", peer.NodeID).
-				Warn("Bootstrap: failed to stream from peer; anti-entropy will catch up")
-			continue
-		}
-
-		for _, entry := range entries {
-			if err := replication.MergeEntry(s.storageEngine, entry); err != nil {
-				logger.WithError(err).WithField("key", entry.Key).
-					Warn("Bootstrap: failed to apply entry")
+		for _, id := range segment.Sources {
+			if !seen[id] {
+				seen[id] = true
+				peers = append(peers, id)
 			}
 		}
-		streamed += len(entries)
+	}
+	sort.Strings(peers)
+
+	complete := make(map[string]bool)
+	var streamed int
+	for _, peer := range peers {
+		count, err := s.streamFromPeer(ctx, peer, ranges)
+		if err != nil {
+			logger.WithError(err).WithField("peer", peer).Warn("Bootstrap: incomplete stream from peer")
+			continue
+		}
+		complete[peer] = true
+		streamed += count
+	}
+
+	var uncovered int
+	for _, segment := range plan {
+		need := len(segment.Sources) - w + 1
+		if need < 1 {
+			need = 1
+		}
+		have := 0
+		for _, id := range segment.Sources {
+			if complete[id] {
+				have++
+			}
+		}
+		if have < need {
+			uncovered++
+		}
+	}
+
+	var failed []string
+	for _, peer := range peers {
+		if !complete[peer] {
+			failed = append(failed, peer)
+		}
+	}
+	if uncovered > 0 {
+		return fmt.Errorf("%d of %d ranges lack a complete stream from enough previous replicas (failed peers: %v)",
+			uncovered, len(plan), failed)
 	}
 
 	logger.WithFields(map[string]interface{}{
 		"ranges":      len(ranges),
 		"entries":     streamed,
-		"failedPeers": failedPeers,
-	}).Info("Bootstrap complete, serving reads")
+		"peers":       len(complete),
+		"failedPeers": failed,
+	}).Info("Bootstrap: every range covered by enough previous replicas")
+	return nil
+}
+
+// streamFromPeer streams our ranges from one peer and applies every entry,
+// bounded by the bootstrap peer timeout. It returns an error unless the whole
+// stream arrived and every entry was applied.
+func (s *DistKVServer) streamFromPeer(ctx context.Context, peer string, ranges []partition.TokenRange) (int, error) {
+	peerCtx, cancel := context.WithTimeout(ctx, s.bootstrapTiming.PeerTimeout)
+	defer cancel()
+
+	entries, err := s.rangeStreamer.StreamRange(peerCtx, peer, ranges)
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		if err := replication.MergeEntry(s.storageEngine, entry); err != nil {
+			return 0, fmt.Errorf("failed to apply key %q: %v", entry.Key, err)
+		}
+	}
+	return len(entries), nil
 }
 
 // contactSeedNode contacts a seed node to get current cluster membership
-func (s *DistKVServer) contactSeedNode(seedAddress string) ([]string, error) {
+func (s *DistKVServer) contactSeedNode(seedAddress string) ([]*proto.NodeStatusInfo, error) {
 	// Create gRPC connection to seed node
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -710,14 +865,7 @@ func (s *DistKVServer) contactSeedNode(seedAddress string) ([]string, error) {
 		return nil, fmt.Errorf("failed to get cluster status: %v", err)
 	}
 
-	// Convert response to node list
-	var nodes []string
-	for _, node := range resp.Nodes {
-		nodeInfo := fmt.Sprintf("%s@%s", node.NodeId, node.Address)
-		nodes = append(nodes, nodeInfo)
-	}
-
-	return nodes, nil
+	return resp.Nodes, nil
 }
 
 // announceSelfToNode announces this node to an existing cluster node

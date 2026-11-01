@@ -36,7 +36,14 @@ This guide covers operational aspects of running DistKV in production.
 
    The node joins in a `joining` state: it receives writes for its new token
    ranges but serves no reads until it has streamed those ranges from its
-   peers. Startup logs `Bootstrap complete, serving reads` when done.
+   peers. It logs `Bootstrap complete, serving reads` when done.
+
+   If a seed is unreachable, a live node cannot be told about the join, or a
+   range cannot be streamed completely from enough previous replicas, the
+   attempt fails with `Bootstrap attempt failed; node stays joining`. The node
+   keeps retrying with backoff (1s doubling to 30s) and never serves reads in
+   the meantime. Join one node at a time, and only when the nodes holding its
+   new ranges are up.
 
 3. **Verify node joined**:
 ```bash

@@ -197,7 +197,7 @@ func (rc *ReplicaClient) SyncRange(ctx context.Context, nodeID string, localHash
 	return entries, nil
 }
 
-// StreamRange fetches every live entry the peer holds in the given token ranges.
+// StreamRange fetches every entry, tombstones included, the peer holds in the given token ranges.
 // A joining node uses it to bootstrap the ranges it is taking over.
 func (rc *ReplicaClient) StreamRange(ctx context.Context, nodeID string, ranges []partition.TokenRange) ([]replication.AntiEntropyEntry, error) {
 	client, err := rc.getNodeServiceClient(nodeID)
@@ -221,6 +221,7 @@ func (rc *ReplicaClient) StreamRange(ctx context.Context, nodeID string, ranges 
 			Key:         kv.Key,
 			Value:       kv.Value,
 			VectorClock: convertVectorClockFromProto(kv.VectorClock),
+			IsDeleted:   kv.IsDeleted,
 		})
 	}
 	return entries, nil
@@ -231,6 +232,13 @@ func (rc *ReplicaClient) StreamRange(ctx context.Context, nodeID string, ranges 
 func (rc *ReplicaClient) UpdateNodeAddress(nodeID, address string) {
 	rc.mutex.Lock()
 	defer rc.mutex.Unlock()
+
+	// Nothing to do if the address is unchanged. Closing the connection anyway
+	// would fail RPCs in flight on it, e.g. replication to a joining node that
+	// re-announces itself on every bootstrap retry.
+	if previous, known := rc.nodeAddresses[nodeID]; known && previous == address {
+		return
+	}
 
 	// Update the address mapping
 	rc.nodeAddresses[nodeID] = address
