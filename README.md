@@ -5,19 +5,21 @@ Distributed key-value store built from scratch in Go, inspired by Amazon's Dynam
 ## Features
 
 - **Fault Tolerance**: Quorum replication (N=3, R=2, W=2) sustains reads and writes through single-node failures
-- **Tunable Consistency**: Configurable N/R/W quorum parameters for consistency vs availability trade-offs
-- **Persistent Storage**: LSM-tree storage engine with MemTables, SSTables, Bloom filters, and level-based compaction
+- **Tunable Consistency**: N/R/W quorum parameters set per server at startup for consistency vs availability trade-offs
+- **Persistent Storage**: LSM-tree storage engine with MemTables, SSTables, Bloom filters, and compaction
+- **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL covering them is deleted, and crash recovery keeps replayed records durable until they are flushed again
 - **Gossip Protocol**: Network-based gossip for cluster membership and failure detection
 - **Consistent Hashing**: Virtual node-based partitioning; new nodes propagate to all peers' hash rings within one gossip interval via event callbacks
 - **Vector Clocks**: Conflict detection and causality tracking with Dynamo-style sibling preservation
 - **Read Repair**: Stale replicas are automatically updated during quorum reads
-- **Anti-Entropy**: Background 30-second sync detects and repairs divergent data across nodes
+- **Anti-Entropy**: Background 30-second sync repairs divergent data for the keys each node replicates
+- **Safe Scale-Out**: A joining node serves no reads until it has streamed its new ranges; previous owners can then reclaim space with a verified `cleanup`
 - **TLS Security**: TLS 1.2+ encryption for all client-server and inter-node communication
 - **Kubernetes**: StatefulSet deployment with headless service discovery
 
 ## System Requirements
 
-- Go 1.19 or later
+- Go 1.24 or later
 - Protocol Buffers compiler (protoc)
 - Make (optional, for build automation)
 
@@ -38,7 +40,7 @@ cd DistKV
 ./scripts/install-prerequisites.sh && make all
 
 # Option 2: Manual
-# - Go 1.19+: https://golang.org/dl/
+# - Go 1.24+: https://golang.org/dl/
 # - protoc: https://github.com/protocolbuffers/protobuf/releases
 ```
 
@@ -93,13 +95,13 @@ make stop-cluster
 
 ### Key Technologies
 
-- **Storage Engine**: LSM-tree with MemTables, SSTables, Bloom filters, and level-based compaction (7 levels, 10x growth per level)
+- **Storage Engine**: LSM-tree with a write-ahead log, MemTables, SSTables, and Bloom filters. The server runs simple compaction (level-0 SSTables are merged into one once 4 accumulate); a level-based strategy (7 levels, 10x growth) exists in the engine but is not enabled by the server
 - **Partitioning**: Consistent hashing with 150 virtual nodes
 - **Replication**: Quorum-based consensus (default: N=3, R=2, W=2)
 - **Conflict Resolution**: Vector clocks with Dynamo-style sibling preservation
 - **Read Repair**: Coordinator detects stale replicas during quorum reads and pushes updates asynchronously
 - **Scale-Out**: A joining node is flagged `joining` in gossip and bootstraps before serving reads: peers send it writes for its new token ranges as a pending replica (required acks become W + pending), while it streams those ranges, tombstones included, from their previous replicas. It becomes readable only once every range has a complete stream from N − W + 1 previous replicas (enough to intersect every write quorum); otherwise it stays joining and retries with backoff. Previous owners keep their copies until an operator runs `cleanup` (see [operations guide](docs/operations.md#cleaning-up-after-adding-a-node)), which removes only keys every current replica already holds
-- **Anti-Entropy**: 30-second background sync; nodes exchange a hash of all local entries and apply missing or causally newer keys
+- **Anti-Entropy**: 30-second background sync; nodes exchange a hash of their local entries and apply missing or causally newer versions of keys they replicate
 - **Failure Detection**: Gossip protocol with heartbeat monitoring
 - **Communication**: gRPC with Protocol Buffers
 
@@ -120,6 +122,7 @@ Options:
   -read-quorum int         Read quorum size R (default: 2)
   -write-quorum int        Write quorum size W (default: 2)
   -virtual-nodes int       Virtual nodes for consistent hashing (default: 150)
+  -mem-table-size int      MemTable size in bytes before a flush (default: 1024)
 
 Durability Options:
   -wal-enabled             Write a write-ahead log before each MemTable insert (default: true)
@@ -141,7 +144,7 @@ distkv-client [options] <command> [args...]
 Options:
   -server string          Server address (default: localhost:8080)
   -timeout duration       Request timeout (default: 5s)
-  -consistency string     Consistency level: one, quorum, all (default: quorum)
+  -consistency string     Sent with requests, but not yet applied by the server (see Consistency Models)
 
 TLS Options:
   -tls-enabled                  Enable TLS (default: false)
@@ -156,8 +159,12 @@ Commands:
   get <key>               Retrieve value for a key
   delete <key>            Delete a key-value pair
   batch <k1> <v1> ...     Store multiple key-value pairs
+  local-get <key>         Read a key from the connected server only (bypasses quorum)
   status                  Show cluster status
+  cleanup [apply]         List (or with apply, remove) keys the server no longer replicates
 ```
+
+The CLI writes without a causal context (no vector clock), so each `put` and `delete` is a blind write. Causal updates need the gRPC API: pass the `vector_clock` returned by a Get or Put back with the next Put or Delete.
 
 ## Testing
 
@@ -167,18 +174,20 @@ Commands:
 make test
 
 # Run specific packages
-go test ./pkg/consensus/...   # Vector clock tests (17 tests)
-go test ./pkg/storage/...     # Storage engine tests (28+ tests)
-go test ./pkg/partition/...   # Consistent hashing tests (22 tests)
-go test ./pkg/gossip/...      # Gossip protocol tests
-go test ./pkg/replication/... # Replication tests
+go test ./pkg/consensus/...   # Vector clocks and version counter
+go test ./pkg/storage/...     # Storage engine, WAL, crash recovery, compaction
+go test ./pkg/partition/...   # Consistent hashing
+go test ./pkg/gossip/...      # Gossip protocol
+go test ./pkg/replication/... # Quorum reads/writes, read repair, anti-entropy
+go test ./cmd/server/...      # In-process clusters: bootstrap, versioning, cleanup
 ```
 
 ### Integration Tests
 
-Integration tests start their own cluster automatically — no need to run `make dev-cluster` first.
+Integration tests start their own cluster from the built server binary, so build it first; no need to run `make dev-cluster`. They use ports 8080–8082, which must be free.
 
 ```bash
+make build
 go test -v -timeout=120s ./tests/integration/...
 ```
 
@@ -197,28 +206,30 @@ Covers: network partition and recovery, sibling preservation under partition, cl
 ```bash
 make dev-cluster
 make benchmark
+
+# Read-only, 90 seconds per concurrency level
+go run ./tests/benchmark -server=localhost:8080 -mode=read -duration=90s
 ```
 
-Sweeps concurrency levels (10→200) for read-only and mixed (50/50 read/write) workloads, reporting QPS, p50/p95/p99 latency, and error rate.
+Sweeps concurrency levels (default 10→200, set with `-concurrency=10,50,100`) for read-only and mixed (50/50 read/write) workloads, reporting QPS, p50/p95/p99 latency, and error rate. Requests go through the single server given by `-server`.
+
+On one 8-core laptop running all three nodes and the client (N=3, R=2, W=2, 1,000 keys of 64 bytes, read-only, 90 s per level, server logs discarded), throughput reached about 25.5K QPS with p99 under 10 ms at concurrency 100 and leveled off near 27K QPS. Treat this as a single-machine prototype figure, not cluster capacity.
 
 ## Consistency Models
 
-### Strong Consistency (W + R > N)
-```bash
-# Default: N=3, W=2, R=2 — reads always return the latest write
-./build/distkv-client -consistency=quorum put key value
-```
+N, R and W are set per server with `-replicas`, `-read-quorum` and `-write-quorum`, and apply to every request. The client's `-consistency` flag is sent with each request but the server does not apply it yet.
 
-### Eventual Consistency (W + R ≤ N)
+### Overlapping Quorums (R + W > N)
 ```bash
-# N=3, W=1, R=1 — high availability, eventual consistency
-./build/distkv-client -consistency=one put key value
+# Default: N=3, R=2, W=2
+./build/distkv-server -node-id=node1 -replicas=3 -read-quorum=2 -write-quorum=2
 ```
+Every read quorum overlaps the replicas that acknowledged the latest successful write, so a read sees that write or a newer version. This is not linearizability: read repair is asynchronous, a write that fails can still have reached some replicas, and concurrent writes surface as siblings.
 
-### All Replicas (W=N, R=1)
+### Eventual Consistency (R + W ≤ N)
 ```bash
-# All replicas must acknowledge writes — strongest consistency, lower availability
-./build/distkv-client -consistency=all put key value
+# N=3, R=1, W=1: highest availability, reads may be stale until repair
+./build/distkv-server -node-id=node1 -replicas=3 -read-quorum=1 -write-quorum=1
 ```
 
 ### Conflict Resolution
@@ -232,9 +243,9 @@ CONFLICT: 2 concurrent versions detected!
   Version 1: Alice (vector clock: map[node1:1])
   Version 2: Bob (vector clock: map[node2:1])
 Please resolve the conflict by writing the correct value with PUT.
-
-$ ./build/distkv-client put user:123 "Alice and Bob"
 ```
+
+To resolve a conflict, write the merged value through the gRPC API with the Get response's `vector_clock` as the causal context: it covers every sibling, so the new version supersedes them all. A `put` from the CLI carries no context, so it is concurrent with the siblings rather than descended from them.
 
 ## Kubernetes Deployment
 
@@ -317,17 +328,17 @@ For detailed TLS configuration see [docs/TLS_SETUP.md](docs/TLS_SETUP.md).
 ```
 DistKV/
 ├── cmd/
-│   ├── server/                  # Server entry point, gRPC services, node routing
+│   ├── server/                  # Server entry point, gRPC services, bootstrap, cleanup
 │   └── client/                  # CLI client
 ├── pkg/
-│   ├── consensus/               # Vector clocks (17 tests)
-│   ├── errors/                  # Structured errors with codes and context (18 tests)
+│   ├── consensus/               # Vector clocks and per-node version counter
+│   ├── errors/                  # Structured errors with codes and context
 │   ├── gossip/                  # Gossip protocol, failure detection, connection pool
-│   ├── logging/                 # Component-based structured logging (15 tests)
-│   ├── metrics/                 # Storage, replication, gossip, network metrics (11 tests)
-│   ├── partition/               # Consistent hashing with virtual nodes (22 tests)
+│   ├── logging/                 # Component-based structured logging
+│   ├── metrics/                 # Storage, replication, gossip, network metrics
+│   ├── partition/               # Consistent hashing with virtual nodes
 │   ├── replication/             # Quorum read/write, anti-entropy, read repair
-│   ├── storage/                 # LSM-tree engine: MemTable, SSTable, Bloom filter, compaction
+│   ├── storage/                 # LSM-tree engine: WAL, MemTable, SSTable, Bloom filter, compaction
 │   └── tls/                     # TLS credential loading
 ├── proto/                       # Protobuf definitions (generated files not committed)
 ├── tests/
