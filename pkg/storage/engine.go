@@ -738,7 +738,10 @@ func (e *Engine) performCompaction() {
 
 	switch e.config.CompactionStrategy {
 	case CompactionLevelBased:
-		e.performLevelBasedCompaction(tracker)
+		// Compacting one level can push the next one over its limit, and only
+		// level 0 triggers compaction, so continue until every level fits
+		for e.performLevelBasedCompaction(tracker) {
+		}
 	case CompactionSizeTiered:
 		e.performSizeTieredCompaction(tracker)
 	default:
@@ -747,8 +750,9 @@ func (e *Engine) performCompaction() {
 }
 
 // performLevelBasedCompaction implements level-based compaction strategy.
-// Level 0 files are compacted into level 1, level 1 into level 2, etc.
-func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
+// Level 0 files are compacted into level 1, level 1 into level 2, etc. It
+// compacts the first level over its limit and reports whether it did.
+func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) bool {
 	e.mutex.Lock()
 
 	// Find the first level that needs compaction
@@ -764,7 +768,7 @@ func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
 	if sourceLevel == -1 {
 		e.mutex.Unlock()
 		e.logger.Debug("No compaction needed at any level")
-		return
+		return false
 	}
 
 	targetLevel := sourceLevel + 1
@@ -780,17 +784,18 @@ func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
 
 	// Select overlapping SSTables from target level
 	targetTables := e.selectOverlappingSSTables(targetLevel, sourceTables)
+	bottom := e.isBottomLevelLocked(targetLevel)
 
 	e.mutex.Unlock()
 
 	// Compact the selected tables, newest first: the source level is newer
 	// than the target level, and within a level later tables are newer
 	allTables := append(newestFirst(sourceTables), newestFirst(targetTables)...)
-	newSSTables, err := e.compactSSTablesForLevel(allTables, targetLevel)
+	newSSTables, err := e.compactSSTablesForLevel(allTables, targetLevel, bottom)
 	if err != nil {
 		e.logger.WithError(err).Error("Level-based compaction failed")
 		e.metrics.Storage().CompactionErrors.Add(1)
-		return
+		return false
 	}
 
 	// Update the engine state
@@ -826,7 +831,8 @@ func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
 	}).Info("Level-based compaction completed")
 
 	// Clean up old tables
-	go e.cleanupOldSSTables(allTables)
+	e.cleanupInBackground(allTables)
+	return true
 }
 
 // performSimpleCompaction merges all SSTables in level 0 into one.
@@ -844,11 +850,12 @@ func (e *Engine) performSimpleCompaction(tracker *metrics.LatencyTracker) {
 
 	tablesToCompact := make([]*SSTable, len(e.sstables[0]))
 	copy(tablesToCompact, e.sstables[0])
+	bottom := e.isBottomLevelLocked(0)
 
 	e.mutex.Unlock()
 
 	// Perform compaction (later tables in a level are newer)
-	newSSTables, err := e.compactSSTablesForLevel(newestFirst(tablesToCompact), 0)
+	newSSTables, err := e.compactSSTablesForLevel(newestFirst(tablesToCompact), 0, bottom)
 	if err != nil {
 		e.logger.WithError(err).Error("Simple compaction failed")
 		e.metrics.Storage().CompactionErrors.Add(1)
@@ -882,7 +889,7 @@ func (e *Engine) performSimpleCompaction(tracker *metrics.LatencyTracker) {
 		"newCount": len(newSSTables),
 	}).Info("Simple compaction completed")
 
-	go e.cleanupOldSSTables(tablesToCompact)
+	e.cleanupInBackground(tablesToCompact)
 }
 
 // performSizeTieredCompaction implements size-tiered compaction (placeholder).
@@ -965,9 +972,24 @@ func newestFirst(tables []*SSTable) []*SSTable {
 	return reversed
 }
 
+// isBottomLevelLocked reports whether no level below level holds any table.
+// Only a compaction into the bottom level may drop expired tombstones: above
+// it, a tombstone may still hide an older value in a deeper level, which
+// would come back if the tombstone were dropped. Caller must hold e.mutex;
+// compactions run one at a time, so the answer holds for the whole compaction.
+func (e *Engine) isBottomLevelLocked(level int) bool {
+	for deeper := level + 1; deeper < len(e.sstables); deeper++ {
+		if len(e.sstables[deeper]) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // compactSSTablesForLevel merges tables, which must be ordered newest first,
-// keeping only the newest version of each key.
-func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]*SSTable, error) {
+// keeping only the newest version of each key. Expired tombstones are dropped
+// only if bottom is set (see isBottomLevelLocked).
+func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int, bottom bool) ([]*SSTable, error) {
 	if len(tables) == 0 {
 		return nil, errors.New(errors.ErrCodeInternal, "no SSTables to compact")
 	}
@@ -1004,8 +1026,8 @@ func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]
 			continue
 		}
 
-		// Skip expired tombstones
-		if entry.Deleted && entry.IsExpired(e.config.TombstoneTTL) {
+		// Skip expired tombstones, unless they may hide data in a deeper level
+		if bottom && entry.Deleted && entry.IsExpired(e.config.TombstoneTTL) {
 			tombstonesRemoved++
 			mergeIterator.Next()
 			continue
@@ -1070,6 +1092,17 @@ func (e *Engine) flushCompactedMemTable(memTable *MemTable, level int, gen uint6
 	newSSTable.level = level
 	newSSTable.gen = gen
 	return newSSTable, nil
+}
+
+// cleanupInBackground deletes compacted tables without holding up the
+// compaction worker; closing a table waits for open iterators on it. Close
+// waits for the cleanup, so a clean shutdown leaves no compacted inputs behind.
+func (e *Engine) cleanupInBackground(tables []*SSTable) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		e.cleanupOldSSTables(tables)
+	}()
 }
 
 // cleanupOldSSTables closes and deletes old SSTable files after compaction.
@@ -1271,6 +1304,7 @@ func (e *Engine) loadExistingSSTables() error {
 		}
 
 		sstable.gen = parseSSTableGen(filepath.Base(filePath))
+		sstable.level = parseSSTableLevel(filepath.Base(filePath))
 		if sstable.gen >= e.nextGen {
 			e.nextGen = sstable.gen + 1
 		}
@@ -1284,7 +1318,45 @@ func (e *Engine) loadExistingSSTables() error {
 		e.sstables[level] = insertByGen(e.sstables[level], sstable)
 	}
 
+	if !e.levelsOrderedLocked() {
+		e.logger.Warn("SSTable levels out of order (compaction interrupted by a crash), loading all tables into level 0")
+		var all []*SSTable
+		for level := range e.sstables {
+			for _, sstable := range e.sstables[level] {
+				all = insertByGen(all, sstable)
+			}
+			e.sstables[level] = make([]*SSTable, 0)
+		}
+		e.sstables[0] = all
+	}
+
 	return nil
+}
+
+// levelsOrderedLocked reports whether every table holds newer data than every
+// table in a deeper level, which reads rely on: they search levels top down.
+// A compaction keeps this true in memory, but a crash after writing its
+// output and before deleting its inputs leaves inputs on disk at a shallower
+// level than an output with the same or newer generation; the output may
+// even be partial. Generation order alone stays correct in that case, since
+// an output's generation is that of its newest input.
+func (e *Engine) levelsOrderedLocked() bool {
+	var maxBelow uint64
+	seenBelow := false
+	for level := len(e.sstables) - 1; level >= 0; level-- {
+		tables := e.sstables[level]
+		if len(tables) == 0 {
+			continue
+		}
+		if seenBelow && tables[0].gen <= maxBelow {
+			return false
+		}
+		if gen := tables[len(tables)-1].gen; !seenBelow || gen > maxBelow {
+			maxBelow = gen
+		}
+		seenBelow = true
+	}
+	return true
 }
 
 // parseSSTableGen extracts the generation from an SSTable file name:
@@ -1304,6 +1376,21 @@ func parseSSTableGen(name string) uint64 {
 	}
 	gen, _ := strconv.ParseUint(parts[len(parts)-1], 10, 64)
 	return gen
+}
+
+// parseSSTableLevel extracts the level from a compacted_L<level>_... file
+// name; flushed tables (sstable_...) are in level 0.
+func parseSSTableLevel(name string) int {
+	rest, ok := strings.CutPrefix(name, "compacted_L")
+	if !ok {
+		return 0
+	}
+	digits, _, _ := strings.Cut(rest, "_")
+	level, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0
+	}
+	return level
 }
 
 // insertByGen inserts table into a level kept sorted by generation, oldest first.

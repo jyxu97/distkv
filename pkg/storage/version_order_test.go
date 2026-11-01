@@ -2,8 +2,10 @@ package storage
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"distkv/pkg/consensus"
 )
@@ -194,4 +196,151 @@ func TestSyncDir(t *testing.T) {
 	if err := syncDir(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("expected an error for a missing directory")
 	}
+}
+
+// levelEngine returns a level-based engine that flushes every write, puts
+// every compacted entry in its own SSTable, and allows 2 tables in level 0, 4
+// in level 1, 8 in level 2 and so on. Tests decide when compaction runs.
+func levelEngine(t *testing.T, dir string) *Engine {
+	t.Helper()
+	cfg := DefaultStorageConfig()
+	cfg.MemTableMaxSize = 1
+	cfg.SSTableMaxSize = 1
+	cfg.CompactionThreshold = 1 << 30
+	cfg.CompactionStrategy = CompactionLevelBased
+	cfg.LevelSizeMultiplier = 2
+	e, err := NewEngine(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	return e
+}
+
+func levelCounts(e *Engine) []int {
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+	counts := make([]int, len(e.sstables))
+	for level, tables := range e.sstables {
+		counts[level] = len(tables)
+	}
+	return counts
+}
+
+// TestLevelCompactionCascades covers a compaction whose output pushes the next
+// level over its limit: that level must be compacted too, not left to grow
+// until the next level-0 trigger (which would compact level 0 again first).
+func TestLevelCompactionCascades(t *testing.T) {
+	e := levelEngine(t, filepath.Join(t.TempDir(), "data"))
+	defer e.Close()
+
+	writeRounds(t, e, 26, 3)
+	e.config.CompactionThreshold = 2
+	e.performCompaction()
+
+	counts := levelCounts(e)
+	for level := 0; level < len(counts)-1; level++ {
+		if counts[level] >= e.maxFilesForLevel(level) {
+			t.Fatalf("level %d holds %d tables, limit %d (levels: %v)", level, counts[level], e.maxFilesForLevel(level), counts)
+		}
+	}
+	assertNewest(t, e, 26, 3, "after cascading compaction")
+}
+
+// TestCompactionKeepsExpiredTombstoneAboveOlderData covers an expired
+// tombstone compacted into a level with older data below it: dropping the
+// tombstone there would bring the deleted value back.
+func TestCompactionKeepsExpiredTombstoneAboveOlderData(t *testing.T) {
+	e := levelEngine(t, filepath.Join(t.TempDir(), "data"))
+	defer e.Close()
+	e.config.TombstoneTTL = time.Nanosecond // Every tombstone is expired
+
+	writeRounds(t, e, 4, 1)
+	e.config.CompactionThreshold = 2
+	e.performCompaction()
+
+	// Move everything to the last level, below the level the tombstone goes to
+	e.mutex.Lock()
+	last := len(e.sstables) - 1
+	for level := 0; level < last; level++ {
+		for _, table := range e.sstables[level] {
+			e.sstables[last] = insertByGen(e.sstables[last], table)
+		}
+		e.sstables[level] = nil
+	}
+	e.mutex.Unlock()
+
+	vc := consensus.NewVectorClockFromMap(map[string]uint64{"A": 2})
+	if err := e.Delete("key-01", vc); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := e.Put("key-02", []byte("v2"), vc); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	e.performCompaction()
+
+	if entry, err := e.Get("key-01"); err == nil {
+		t.Fatalf("deleted key-01 is back after compaction: %s", entry.Value)
+	}
+}
+
+// TestRestartKeepsSSTableLevels covers reopening an engine after level-based
+// compaction: tables must return to their levels, not all to level 0.
+func TestRestartKeepsSSTableLevels(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	e := levelEngine(t, dir)
+	writeRounds(t, e, 26, 3)
+	e.config.CompactionThreshold = 2
+	e.performCompaction()
+	before := levelCounts(e)
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened := levelEngine(t, dir)
+	defer reopened.Close()
+	after := levelCounts(reopened)
+	for level := 1; level < len(before); level++ {
+		if before[level] != after[level] {
+			t.Fatalf("levels before restart %v, after %v", before, after)
+		}
+	}
+	assertNewest(t, reopened, 26, 3, "after restart")
+}
+
+// TestRestartAfterInterruptedCompaction covers a crash after compaction wrote
+// its output but before it deleted its inputs: old level-0 inputs are then on
+// disk next to the newer level-1 output, and must not be read ahead of it.
+func TestRestartAfterInterruptedCompaction(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	e := levelEngine(t, dir)
+
+	// Keep copies of the tables holding the oldest version of every key
+	writeRounds(t, e, 26, 1)
+	tables, _ := filepath.Glob(filepath.Join(dir, "sstables", "sstable_*"))
+	saved := make(map[string][]byte)
+	for _, path := range tables {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		saved[path] = data
+	}
+
+	writeRounds(t, e, 26, 3)
+	e.config.CompactionThreshold = 2
+	e.performCompaction()
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Put the deleted inputs back, as a crash before their deletion would
+	for path, data := range saved {
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	reopened := levelEngine(t, dir)
+	defer reopened.Close()
+	assertNewest(t, reopened, 26, 3, "after an interrupted compaction")
 }

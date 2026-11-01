@@ -187,6 +187,7 @@ func main() {
 // parseFlags parses command line arguments and returns server configuration.
 // The flag set is a parameter so tests can parse without touching flag.CommandLine.
 func parseFlags(fs *flag.FlagSet, args []string) (*ServerConfig, error) {
+	storageConfig := storage.DefaultStorageConfig()
 	var (
 		nodeID           = fs.String("node-id", "", "Unique node identifier (required)")
 		address          = fs.String("address", "localhost:8080", "Server listen address")
@@ -196,12 +197,13 @@ func parseFlags(fs *flag.FlagSet, args []string) (*ServerConfig, error) {
 		virtualNodes     = fs.Int("virtual-nodes", 150, "Number of virtual nodes for consistent hashing")
 
 		// Storage flags
-		memTableSize     = fs.Int("mem-table-size", 1024, "MemTable size in bytes")
-		ssTableSize      = fs.Int64("sstable-size", 256*1024*1024, "SSTable size in bytes")
-		bloomFilterBits  = fs.Int("bloom-filter-bits", 10, "Bloom filter bits per key")
-		compactionThresh = fs.Int("compaction-threshold", 4, "Number of SSTables to trigger compaction")
-		walEnabled       = fs.Bool("wal-enabled", true, "Write a write-ahead log before each MemTable insert")
-		walSync          = fs.Bool("wal-sync", true, "fsync the WAL before acknowledging each write (false risks losing recent writes on power loss)")
+		memTableSize       = fs.Int("mem-table-size", storageConfig.MemTableMaxSize, "MemTable size in bytes before a flush")
+		ssTableSize        = fs.Int64("sstable-size", storageConfig.SSTableMaxSize, "SSTable size in bytes")
+		bloomFilterBits    = fs.Int("bloom-filter-bits", storageConfig.BloomFilterBits, "Bloom filter bits per key")
+		compactionThresh   = fs.Int("compaction-threshold", storageConfig.CompactionThreshold, "Number of level-0 SSTables to trigger compaction")
+		compactionStrategy = fs.String("compaction-strategy", "level", "SSTable compaction: level (leveled, 10x per level) or simple (merge level 0 into one table)")
+		walEnabled         = fs.Bool("wal-enabled", storageConfig.WALEnabled, "Write a write-ahead log before each MemTable insert")
+		walSync            = fs.Bool("wal-sync", storageConfig.WALSyncOnPut, "fsync the WAL before acknowledging each write (false risks losing recent writes on power loss)")
 
 		// Replication flags
 		replicas    = fs.Int("replicas", 3, "Number of replicas (N)")
@@ -246,6 +248,21 @@ func parseFlags(fs *flag.FlagSet, args []string) (*ServerConfig, error) {
 		}
 	}
 
+	switch *compactionStrategy {
+	case "level":
+		storageConfig.CompactionStrategy = storage.CompactionLevelBased
+	case "simple":
+		storageConfig.CompactionStrategy = storage.CompactionSimple
+	default:
+		return nil, fmt.Errorf("unknown -compaction-strategy %q: use level or simple", *compactionStrategy)
+	}
+	storageConfig.MemTableMaxSize = *memTableSize
+	storageConfig.SSTableMaxSize = *ssTableSize
+	storageConfig.BloomFilterBits = *bloomFilterBits
+	storageConfig.CompactionThreshold = *compactionThresh
+	storageConfig.WALEnabled = *walEnabled
+	storageConfig.WALSyncOnPut = *walSync
+
 	// Parse TLS client auth type
 	var clientAuthType cryptotls.ClientAuthType
 	switch *tlsClientAuth {
@@ -271,22 +288,7 @@ func parseFlags(fs *flag.FlagSet, args []string) (*ServerConfig, error) {
 		SeedNodes:        seedNodesList,
 		VirtualNodes:     *virtualNodes,
 
-		StorageConfig: &storage.StorageConfig{
-			MemTableMaxSize:     *memTableSize,
-			MaxMemTables:        2,
-			SSTableMaxSize:      *ssTableSize,
-			BloomFilterBits:     *bloomFilterBits,
-			CompressionEnabled:  true,
-			CompactionThreshold: *compactionThresh,
-			MaxCompactionSize:   1024 * 1024 * 1024, // 1GB
-			TombstoneTTL:        3 * time.Hour,
-			GCInterval:          1 * time.Hour,
-			WriteBufferSize:     4 * 1024 * 1024,
-			CacheSize:           128 * 1024 * 1024,
-			MaxOpenFiles:        1000,
-			WALEnabled:          *walEnabled,
-			WALSyncOnPut:        *walSync,
-		},
+		StorageConfig: storageConfig,
 
 		QuorumConfig: &replication.QuorumConfig{
 			N:              *replicas,

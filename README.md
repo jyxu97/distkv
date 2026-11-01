@@ -7,7 +7,7 @@ Distributed key-value store built from scratch in Go, inspired by Amazon's Dynam
 - **Fault Tolerance**: Quorum replication (N=3, R=2, W=2) sustains reads and writes through single-node failures
 - **Tunable Consistency**: N/R/W quorum parameters set per server at startup, and a per-request consistency level (ONE/QUORUM/ALL) for reads, or for writes that need more acks than W
 - **Persistent Storage**: LSM-tree storage engine with MemTables, SSTables, Bloom filters, and compaction
-- **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL covering them is deleted, and crash recovery keeps replayed records durable until they are flushed again
+- **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL covering them is deleted, crash recovery keeps replayed records durable until they are flushed again, and a compaction interrupted by a crash never lets its old input tables shadow newer output
 - **Gossip Protocol**: Network-based gossip for cluster membership and failure detection
 - **Consistent Hashing**: Virtual node-based partitioning; new nodes propagate to all peers' hash rings within one gossip interval via event callbacks
 - **Vector Clocks**: Conflict detection and causality tracking with Dynamo-style sibling preservation
@@ -95,7 +95,7 @@ make stop-cluster
 
 ### Key Technologies
 
-- **Storage Engine**: LSM-tree with a write-ahead log, MemTables, SSTables, and Bloom filters. The server runs simple compaction (level-0 SSTables are merged into one once 4 accumulate); a level-based strategy (7 levels, 10x growth) exists in the engine but is not enabled by the server
+- **Storage Engine**: LSM-tree with a write-ahead log, 64 MB MemTables, SSTables, and Bloom filters. Level-based compaction by default: 4 level-0 SSTables trigger a merge into level 1, and each deeper level holds 10x more tables (7 levels). Expired tombstones are dropped only in the bottom level, so they cannot uncover older data below them. `-compaction-strategy=simple` instead merges level 0 into one table
 - **Partitioning**: Consistent hashing with 150 virtual nodes
 - **Replication**: Quorum-based consensus (default: N=3, R=2, W=2)
 - **Conflict Resolution**: Vector clocks with Dynamo-style sibling preservation
@@ -122,7 +122,9 @@ Options:
   -read-quorum int         Read quorum size R (default: 2)
   -write-quorum int        Write quorum size W (default: 2)
   -virtual-nodes int       Virtual nodes for consistent hashing (default: 150)
-  -mem-table-size int      MemTable size in bytes before a flush (default: 1024)
+  -mem-table-size int      MemTable size in bytes before a flush (default: 67108864, 64 MB)
+  -compaction-strategy     level or simple (default: level)
+  -compaction-threshold    Level-0 SSTables that trigger compaction (default: 4)
 
 Durability Options:
   -wal-enabled             Write a write-ahead log before each MemTable insert (default: true)
@@ -213,7 +215,7 @@ go run ./tests/benchmark -server=localhost:8080 -mode=read -duration=90s
 
 Sweeps concurrency levels (default 10→200, set with `-concurrency=10,50,100`) for read-only and mixed (50/50 read/write) workloads, reporting QPS, p50/p95/p99 latency, and error rate. Requests go through the single server given by `-server`.
 
-On one 8-core laptop running all three nodes and the client (N=3, R=2, W=2, 1,000 keys of 64 bytes, read-only, 90 s per level, server logs discarded), throughput reached about 25.5K QPS with p99 under 10 ms at concurrency 100 and leveled off near 27K QPS. Treat this as a single-machine prototype figure, not cluster capacity.
+On one 8-core laptop running all three nodes and the client (N=3, R=2, W=2, 1,000 keys of 64 bytes, read-only, 90 s per level, server logs discarded, measured before the server's defaults changed to a 64 MB MemTable and level-based compaction), throughput reached about 25.5K QPS with p99 under 10 ms at concurrency 100 and leveled off near 27K QPS. Treat this as a single-machine prototype figure, not cluster capacity.
 
 ## Consistency Models
 
