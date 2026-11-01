@@ -5,7 +5,7 @@ Distributed key-value store built from scratch in Go, inspired by Amazon's Dynam
 ## Features
 
 - **Fault Tolerance**: Quorum replication (N=3, R=2, W=2) sustains reads and writes through single-node failures
-- **Tunable Consistency**: N/R/W quorum parameters set per server at startup for consistency vs availability trade-offs
+- **Tunable Consistency**: N/R/W quorum parameters set per server at startup, and a per-request consistency level (ONE/QUORUM/ALL) for reads, or for writes that need more acks than W
 - **Persistent Storage**: LSM-tree storage engine with MemTables, SSTables, Bloom filters, and compaction
 - **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL covering them is deleted, and crash recovery keeps replayed records durable until they are flushed again
 - **Gossip Protocol**: Network-based gossip for cluster membership and failure detection
@@ -144,7 +144,7 @@ distkv-client [options] <command> [args...]
 Options:
   -server string          Server address (default: localhost:8080)
   -timeout duration       Request timeout (default: 5s)
-  -consistency string     Sent with requests, but not yet applied by the server (see Consistency Models)
+  -consistency string     one, quorum or all (default: the server's R and W; see Consistency Models)
 
 TLS Options:
   -tls-enabled                  Enable TLS (default: false)
@@ -179,7 +179,7 @@ go test ./pkg/storage/...     # Storage engine, WAL, crash recovery, compaction
 go test ./pkg/partition/...   # Consistent hashing
 go test ./pkg/gossip/...      # Gossip protocol
 go test ./pkg/replication/... # Quorum reads/writes, read repair, anti-entropy
-go test ./cmd/server/...      # In-process clusters: bootstrap, versioning, cleanup
+go test ./cmd/server/...      # In-process clusters: bootstrap, versioning, cleanup, consistency levels
 ```
 
 ### Integration Tests
@@ -191,7 +191,7 @@ make build
 go test -v -timeout=120s ./tests/integration/...
 ```
 
-Covers: basic put/get/delete, consistency levels (ONE/QUORUM/ALL), node failure, concurrent writes, sibling preservation.
+Covers: basic put/get/delete, consistency levels (ONE/QUORUM/ALL, including a ONE write refused with W=2), node failure, concurrent writes, sibling preservation.
 
 ### Chaos Tests
 
@@ -217,7 +217,12 @@ On one 8-core laptop running all three nodes and the client (N=3, R=2, W=2, 1,00
 
 ## Consistency Models
 
-N, R and W are set per server with `-replicas`, `-read-quorum` and `-write-quorum`, and apply to every request. The client's `-consistency` flag is sent with each request but the server does not apply it yet.
+N, R and W are set per server with `-replicas`, `-read-quorum` and `-write-quorum`. A request without a consistency level uses R (reads) or W (writes). A request can also name a level, which the coordinator turns into a replica count: ONE = 1, QUORUM = N/2 + 1, ALL = N.
+
+- **Reads** accept any level. ONE answers from the first replica and may return a stale value; ALL fails if any replica is unreachable.
+- **Writes** accept a level only if it needs at least W acks; with the default W=2, a write at ONE is refused. Bootstrap depends on every acknowledged write being on at least W replicas: that is how a joining node knows that streaming from any `sources − W + 1` previous replicas covers every acknowledged write. A write still goes to every replica either way; the level only changes how many acks the coordinator waits for.
+
+The `ConsistencyLevel` enum's zero value is `DEFAULT` (ONE = 1, QUORUM = 2, ALL = 3), so a request that leaves the level unset gets the server's R or W rather than ONE. Clients built against an older `distkv.proto`, where ONE was 0, must be regenerated and rebuilt.
 
 ### Overlapping Quorums (R + W > N)
 ```bash

@@ -33,11 +33,13 @@ service AdminService {
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
 }
 
-// Consistency levels
+// Consistency levels: how many replicas must answer a request. A write may
+// not ask for fewer acks than the server's W (see QuorumManager.Write).
 enum ConsistencyLevel {
-  ONE = 0;      // Only need 1 node to confirm
-  QUORUM = 1;   // Need majority of nodes to confirm
-  ALL = 2;      // Need all nodes to confirm
+  DEFAULT = 0;  // The server's configured R (reads) or W (writes)
+  ONE = 1;      // Need 1 node to confirm
+  QUORUM = 2;   // Need a majority (N/2 + 1) of nodes to confirm
+  ALL = 3;      // Need all N nodes to confirm
 }
 
 // Vector clock for conflict resolution: Tracks the order of events across different nodes

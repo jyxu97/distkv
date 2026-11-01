@@ -9,44 +9,27 @@ import (
 	"distkv/proto"
 )
 
-// TestParseFlags tests command line flag parsing
-func TestParseFlags(t *testing.T) {
-	// Note: This test doesn't actually call parseFlags because it uses flag.Parse()
-	// which can only be called once per test run. Instead we test the logic.
-
+// TestParseConsistency tests conversion of the -consistency flag
+func TestParseConsistency(t *testing.T) {
 	tests := []struct {
-		name             string
-		consistencyInput string
-		expectedLevel    proto.ConsistencyLevel
+		input string
+		want  proto.ConsistencyLevel
 	}{
-		{"one consistency", "one", proto.ConsistencyLevel_ONE},
-		{"quorum consistency", "quorum", proto.ConsistencyLevel_QUORUM},
-		{"all consistency", "all", proto.ConsistencyLevel_ALL},
-		{"ONE uppercase", "ONE", proto.ConsistencyLevel_ONE},
-		{"QuOrUm mixed", "QuOrUm", proto.ConsistencyLevel_QUORUM},
-		{"invalid defaults to one", "invalid", proto.ConsistencyLevel_ONE},
-		{"empty defaults to one", "", proto.ConsistencyLevel_ONE},
+		{"", proto.ConsistencyLevel_DEFAULT},
+		{"one", proto.ConsistencyLevel_ONE},
+		{"quorum", proto.ConsistencyLevel_QUORUM},
+		{"all", proto.ConsistencyLevel_ALL},
+		{"ONE", proto.ConsistencyLevel_ONE},
+		{"QuOrUm", proto.ConsistencyLevel_QUORUM},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Test consistency level conversion logic
-			var consistencyLevel proto.ConsistencyLevel
-			switch strings.ToLower(tt.consistencyInput) {
-			case "one":
-				consistencyLevel = proto.ConsistencyLevel_ONE
-			case "quorum":
-				consistencyLevel = proto.ConsistencyLevel_QUORUM
-			case "all":
-				consistencyLevel = proto.ConsistencyLevel_ALL
-			default:
-				consistencyLevel = proto.ConsistencyLevel_ONE
-			}
-
-			if consistencyLevel != tt.expectedLevel {
-				t.Errorf("Expected %v, got %v", tt.expectedLevel, consistencyLevel)
-			}
-		})
+		got, err := parseConsistency(tt.input)
+		if err != nil || got != tt.want {
+			t.Errorf("parseConsistency(%q) = %v, %v; want %v", tt.input, got, err, tt.want)
+		}
+	}
+	if _, err := parseConsistency("invalid"); err == nil {
+		t.Error("parseConsistency accepted an unknown level")
 	}
 }
 

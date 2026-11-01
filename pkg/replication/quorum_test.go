@@ -924,3 +924,66 @@ func TestReadRepairFillsMissingReplica(t *testing.T) {
 	}
 	t.Error("Expected read repair to push the winning version to node2")
 }
+
+// TestWriteRequestQuorum covers per-request write quorums: a request may
+// require more acks than W but never fewer, since bootstrap counts on every
+// acknowledged write being on at least W replicas.
+func TestWriteRequestQuorum(t *testing.T) {
+	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second}
+	replicas := []ReplicaInfo{{NodeID: "node1"}, {NodeID: "node2"}, {NodeID: "node3"}}
+	selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas}
+	client := &MockReplicaClient{writeResponses: map[string]*ReplicaResponse{
+		"node2": {NodeID: "node2", Success: false, Error: errors.New("write failed")},
+	}}
+	qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+	write := func(quorum int) (*WriteResponse, error) {
+		return qm.Write(&WriteRequest{Key: "k", Value: []byte("v"),
+			VectorClock: consensus.NewVectorClock(), Context: context.Background(), Quorum: quorum})
+	}
+
+	if resp, err := write(0); err != nil || !resp.Success {
+		t.Fatalf("write with the default W failed: %v", err)
+	}
+	if resp, err := write(3); err == nil || resp.Success {
+		t.Fatal("write requiring all 3 acks succeeded with one replica failing")
+	}
+
+	client.repairCallNodes = nil
+	for _, quorum := range []int{1, 4} {
+		if _, err := write(quorum); err == nil {
+			t.Fatalf("write requiring %d acks accepted with N=3, W=2", quorum)
+		}
+	}
+	if len(client.repairCallNodes) != 0 {
+		t.Fatalf("rejected writes reached replicas %v", client.repairCallNodes)
+	}
+}
+
+// TestReadRequestQuorum covers per-request read quorums from 1 to N.
+func TestReadRequestQuorum(t *testing.T) {
+	config := &QuorumConfig{N: 3, R: 2, W: 2, RequestTimeout: 5 * time.Second}
+	replicas := []ReplicaInfo{{NodeID: "node1"}, {NodeID: "node2"}, {NodeID: "node3"}}
+	selector := &MockNodeSelector{aliveReplicas: replicas, replicas: replicas}
+	client := &MockReplicaClient{readResponses: map[string]*ReplicaResponse{
+		"node3": {NodeID: "node3", Success: false, Error: errors.New("read failed")},
+	}}
+	qm, _ := NewQuorumManager(config, selector, client, NewMockStorageEngine())
+
+	read := func(quorum int) (*ReadResponse, error) {
+		return qm.Read(&ReadRequest{Key: "k", Context: context.Background(), Quorum: quorum})
+	}
+
+	if resp, err := read(1); err != nil || resp.ReplicasRead != 1 {
+		t.Fatalf("read requiring 1 reply: %v, %v", resp, err)
+	}
+	if resp, err := read(0); err != nil || resp.ReplicasRead != 2 {
+		t.Fatalf("read with the default R: %v, %v", resp, err)
+	}
+	if _, err := read(3); err == nil {
+		t.Fatal("read requiring all 3 replies succeeded with one replica failing")
+	}
+	if _, err := read(4); err == nil {
+		t.Fatal("read requiring 4 replies accepted with N=3")
+	}
+}

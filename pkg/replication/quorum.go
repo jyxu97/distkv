@@ -86,6 +86,7 @@ type WriteRequest struct {
 	Value       []byte                 // The value to store
 	VectorClock *consensus.VectorClock // Version information
 	Context     context.Context        // Request context for timeouts
+	Quorum      int                    // Acks required; 0 means W. Never fewer than W
 }
 
 // WriteResponse represents the response from a write operation.
@@ -100,6 +101,7 @@ type WriteResponse struct {
 type ReadRequest struct {
 	Key     string          // The key to read
 	Context context.Context // Request context for timeouts
+	Quorum  int             // Replies required, from 1 to N; 0 means R
 }
 
 // Sibling represents one concurrent version of a value.
@@ -222,11 +224,40 @@ func NewQuorumManager(config *QuorumConfig, nodeSelector NodeSelector, client Re
 	}, nil
 }
 
+// writeQuorum returns the acks a write needs. A request may ask for more than
+// W, never fewer: every acknowledged write must be on at least W replicas,
+// because bootstrap relies on it to know how many previous replicas to stream
+// each range from (any len(sources)-W+1 of them hold every acknowledged write).
+func (qm *QuorumManager) writeQuorum(requested int) (int, error) {
+	switch {
+	case requested == 0:
+		return qm.config.W, nil
+	case requested < qm.config.W:
+		return 0, fmt.Errorf("write needs at least W=%d acks in this cluster, %d requested", qm.config.W, requested)
+	case requested > qm.config.N:
+		return 0, fmt.Errorf("write cannot require %d acks with N=%d replicas", requested, qm.config.N)
+	}
+	return requested, nil
+}
+
+// readQuorum returns the replies a read needs. Fewer than R is allowed: the
+// read may then miss the newest write, which only affects that client.
+func (qm *QuorumManager) readQuorum(requested int) (int, error) {
+	switch {
+	case requested == 0:
+		return qm.config.R, nil
+	case requested < 0 || requested > qm.config.N:
+		return 0, fmt.Errorf("read cannot require %d replies with N=%d replicas", requested, qm.config.N)
+	}
+	return requested, nil
+}
+
 // Write performs a quorum write operation.
-// It writes to W replicas and returns success when enough replicas acknowledge.
-// Bootstrapping (pending) replicas also receive the write, and each one raises
-// the required acks by one, so W of the acks still come from readable replicas
-// (the same rule Cassandra uses for pending ranges).
+// It writes to every replica and returns success once W of them (or the
+// request's larger Quorum) acknowledge. Bootstrapping (pending) replicas also
+// receive the write, and each one raises the required acks by one, so W of
+// the acks still come from readable replicas (the same rule Cassandra uses for
+// pending ranges).
 func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 	tracker := metrics.NewLatencyTracker()
 	defer func() {
@@ -239,12 +270,17 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 		return nil, errors.New(errors.ErrCodeInvalidKey, "key cannot be empty")
 	}
 
+	w, err := qm.writeQuorum(req.Quorum)
+	if err != nil {
+		return nil, err
+	}
+
 	qm.logger.WithField("key", req.Key).Debug("Starting quorum write")
 
 	// Get replica nodes for this key
 	replicas := qm.nodeSelector.GetAliveReplicas(req.Key, qm.config.N)
 	pending := qm.nodeSelector.GetPendingReplicas(req.Key, qm.config.N)
-	required := qm.config.W + len(pending)
+	required := w + len(pending)
 
 	qm.logger.WithFields(map[string]interface{}{
 		"key":           req.Key,
@@ -253,9 +289,9 @@ func (qm *QuorumManager) Write(req *WriteRequest) (*WriteResponse, error) {
 		"requiredCount": required,
 	}).Debug("Found replicas for write operation")
 
-	if len(replicas) < qm.config.W {
+	if len(replicas) < w {
 		return nil, fmt.Errorf("insufficient alive replicas: need %d, have %d",
-			qm.config.W, len(replicas))
+			w, len(replicas))
 	}
 
 	targets := append(append([]ReplicaInfo{}, replicas...), pending...)
@@ -356,6 +392,11 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 		return nil, errors.New(errors.ErrCodeInvalidKey, "key cannot be empty")
 	}
 
+	r, err := qm.readQuorum(req.Quorum)
+	if err != nil {
+		return nil, err
+	}
+
 	qm.logger.WithField("key", req.Key).Debug("Starting quorum read")
 
 	// Get replica nodes for this key
@@ -364,12 +405,12 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 	qm.logger.WithFields(map[string]interface{}{
 		"key":           req.Key,
 		"replicaCount":  len(replicas),
-		"requiredCount": qm.config.R,
+		"requiredCount": r,
 	}).Debug("Found replicas for read operation")
 
-	if len(replicas) < qm.config.R {
+	if len(replicas) < r {
 		return nil, fmt.Errorf("insufficient alive replicas: need %d, have %d",
-			qm.config.R, len(replicas))
+			r, len(replicas))
 	}
 
 	// Create context with timeout
@@ -381,7 +422,7 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 	}
 
 	// Send read requests to all available replicas concurrently; return as soon
-	// as R succeed. This matches Dynamo's approach: we don't know in advance
+	// as r succeed. This matches Dynamo's approach: we don't know in advance
 	// which replicas will respond, so we fan out to all and take the first R.
 	responseChan := make(chan *ReplicaResponse, len(replicas))
 
@@ -409,7 +450,7 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 		case response := <-responseChan:
 			if response.Success {
 				responses = append(responses, response)
-				if len(responses) >= qm.config.R {
+				if len(responses) >= r {
 					goto quorumMet
 				}
 			} else {
@@ -426,25 +467,25 @@ func (qm *QuorumManager) Read(req *ReadRequest) (*ReadResponse, error) {
 quorumMet:
 
 	// Check if we got enough responses
-	if len(responses) < qm.config.R {
+	if len(responses) < r {
 		qm.metrics.Replication().QuorumReadFailed.Add(1)
 		qm.logger.WithFields(map[string]interface{}{
 			"key":       req.Key,
 			"responses": len(responses),
-			"required":  qm.config.R,
+			"required":  r,
 		}).Warn("Quorum read failed")
 		return &ReadResponse{
 			Found:        false,
 			ReplicasRead: len(responses),
 			Errors:       errs,
-		}, errors.NewQuorumFailedError(qm.config.R, len(responses))
+		}, errors.NewQuorumFailedError(r, len(responses))
 	}
 
 	qm.metrics.Replication().QuorumReadSuccess.Add(1)
 	qm.logger.WithFields(map[string]interface{}{
 		"key":       req.Key,
 		"responses": len(responses),
-		"required":  qm.config.R,
+		"required":  r,
 	}).Debug("Quorum read succeeded")
 
 	// Resolve conflicts and find the most recent version

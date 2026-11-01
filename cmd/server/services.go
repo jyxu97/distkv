@@ -27,7 +27,7 @@ type DistKVServiceImpl struct {
 
 // Put stores a key-value pair using quorum replication
 func (s *DistKVServiceImpl) Put(ctx context.Context, req *proto.PutRequest) (*proto.PutResponse, error) {
-	writeResp, err := s.coordinateWrite(ctx, req.Key, req.Value, req.VectorClock)
+	writeResp, err := s.coordinateWrite(ctx, req.Key, req.Value, req.VectorClock, req.ConsistencyLevel)
 	if err != nil {
 		return &proto.PutResponse{
 			Success:      false,
@@ -48,7 +48,7 @@ func (s *DistKVServiceImpl) Put(ctx context.Context, req *proto.PutRequest) (*pr
 // advanced to a value it has never issued before, even across restarts.
 // Replicas store that clock unchanged, and it is what the client gets back.
 // A nil value writes a tombstone.
-func (s *DistKVServiceImpl) coordinateWrite(ctx context.Context, key string, value []byte, causalContext *proto.VectorClock) (*replication.WriteResponse, error) {
+func (s *DistKVServiceImpl) coordinateWrite(ctx context.Context, key string, value []byte, causalContext *proto.VectorClock, level proto.ConsistencyLevel) (*replication.WriteResponse, error) {
 	var contextVC *consensus.VectorClock
 	if causalContext != nil {
 		contextVC = convertVectorClockFromProto(causalContext)
@@ -64,7 +64,25 @@ func (s *DistKVServiceImpl) coordinateWrite(ctx context.Context, key string, val
 		Value:       value,
 		VectorClock: version,
 		Context:     ctx,
+		Quorum:      s.replicasFor(level),
 	})
+}
+
+// replicasFor converts a consistency level to the number of replicas that
+// must answer, or 0 for the server's configured R or W. The quorum manager
+// rejects counts the cluster cannot honour, such as a write below W.
+func (s *DistKVServiceImpl) replicasFor(level proto.ConsistencyLevel) int {
+	n := s.server.config.QuorumConfig.N
+	switch level {
+	case proto.ConsistencyLevel_ONE:
+		return 1
+	case proto.ConsistencyLevel_QUORUM:
+		return n/2 + 1
+	case proto.ConsistencyLevel_ALL:
+		return n
+	default:
+		return 0
+	}
 }
 
 // Get retrieves a value by key using quorum reads
@@ -73,6 +91,7 @@ func (s *DistKVServiceImpl) Get(ctx context.Context, req *proto.GetRequest) (*pr
 	readReq := &replication.ReadRequest{
 		Key:     req.Key,
 		Context: ctx,
+		Quorum:  s.replicasFor(req.ConsistencyLevel),
 	}
 
 	// Perform quorum read
@@ -121,7 +140,7 @@ func (s *DistKVServiceImpl) Get(ctx context.Context, req *proto.GetRequest) (*pr
 // this coordinator.
 func (s *DistKVServiceImpl) Delete(ctx context.Context, req *proto.DeleteRequest) (*proto.DeleteResponse, error) {
 	// A nil value indicates deletion
-	writeResp, err := s.coordinateWrite(ctx, req.Key, nil, req.VectorClock)
+	writeResp, err := s.coordinateWrite(ctx, req.Key, nil, req.VectorClock, req.ConsistencyLevel)
 	if err != nil {
 		return &proto.DeleteResponse{
 			Success:      false,

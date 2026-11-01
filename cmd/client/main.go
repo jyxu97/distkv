@@ -128,7 +128,7 @@ func parseFlags() (*ClientConfig, []string) {
 	var (
 		serverAddr  = flag.String("server", "localhost:8080", "DistKV server address")
 		timeout     = flag.Duration("timeout", 5*time.Second, "Request timeout")
-		consistency = flag.String("consistency", "one", "Consistency level (one, quorum, all)")
+		consistency = flag.String("consistency", "", "Consistency level: one, quorum or all (default: the server's R and W)")
 
 		// TLS flags
 		tlsEnabled            = flag.Bool("tls-enabled", false, "Enable TLS for secure communication")
@@ -143,17 +143,9 @@ func parseFlags() (*ClientConfig, []string) {
 	flag.Parse()
 	remainingArgs := flag.Args()
 
-	// Convert consistency level
-	var consistencyLevel proto.ConsistencyLevel
-	switch strings.ToLower(*consistency) {
-	case "one":
-		consistencyLevel = proto.ConsistencyLevel_ONE
-	case "quorum":
-		consistencyLevel = proto.ConsistencyLevel_QUORUM
-	case "all":
-		consistencyLevel = proto.ConsistencyLevel_ALL
-	default:
-		consistencyLevel = proto.ConsistencyLevel_ONE
+	consistencyLevel, err := parseConsistency(*consistency)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	return &ClientConfig{
@@ -169,6 +161,23 @@ func parseFlags() (*ClientConfig, []string) {
 			InsecureSkipVerify: *tlsInsecureSkipVerify,
 		},
 	}, remainingArgs
+}
+
+// parseConsistency converts the -consistency flag to a consistency level.
+// An empty value lets the server use its configured R and W.
+func parseConsistency(value string) (proto.ConsistencyLevel, error) {
+	switch strings.ToLower(value) {
+	case "":
+		return proto.ConsistencyLevel_DEFAULT, nil
+	case "one":
+		return proto.ConsistencyLevel_ONE, nil
+	case "quorum":
+		return proto.ConsistencyLevel_QUORUM, nil
+	case "all":
+		return proto.ConsistencyLevel_ALL, nil
+	default:
+		return 0, fmt.Errorf("unknown consistency level %q: use one, quorum or all", value)
+	}
 }
 
 // NewDistKVClient creates a new DistKV client
@@ -437,7 +446,8 @@ func printUsage() {
 	fmt.Println("Options:")
 	fmt.Println("  -server <address>     Server address (default: localhost:8080)")
 	fmt.Println("  -timeout <duration>   Request timeout (default: 5s)")
-	fmt.Println("  -consistency <level>  Consistency level: one, quorum, all (default: quorum)")
+	fmt.Println("  -consistency <level>  Consistency level: one, quorum, all (default: the server's R and W;")
+	fmt.Println("                        writes may not use fewer acks than the server's W)")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  put <key> <value>           Store a key-value pair")

@@ -218,7 +218,8 @@ func TestBasicOperations(t *testing.T) {
 	})
 }
 
-// TestConsistencyLevels tests different consistency levels
+// TestConsistencyLevels tests different consistency levels. The cluster runs
+// with W=2, so a write at ONE is refused; reads may use any level.
 func TestConsistencyLevels(t *testing.T) {
 	cluster := SetupCluster(t, 3)
 	defer cluster.TearDown()
@@ -232,6 +233,7 @@ func TestConsistencyLevels(t *testing.T) {
 		{"ONE", proto.ConsistencyLevel_ONE},
 		{"QUORUM", proto.ConsistencyLevel_QUORUM},
 		{"ALL", proto.ConsistencyLevel_ALL},
+		{"DEFAULT", proto.ConsistencyLevel_DEFAULT},
 	}
 
 	for _, tc := range testCases {
@@ -250,6 +252,16 @@ func TestConsistencyLevels(t *testing.T) {
 			putResp, err := client.Put(ctx, putReq)
 			if err != nil {
 				t.Fatalf("Put failed: %v", err)
+			}
+
+			if tc.consistency == proto.ConsistencyLevel_ONE {
+				if putResp.Success {
+					t.Fatal("Put at ONE accepted although W=2")
+				}
+				putReq.ConsistencyLevel = proto.ConsistencyLevel_DEFAULT
+				if putResp, err = client.Put(ctx, putReq); err != nil {
+					t.Fatalf("Put failed: %v", err)
+				}
 			}
 
 			if !putResp.Success {
@@ -439,8 +451,8 @@ func TestSiblingPreservationOnConcurrentWrites(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Write the same key concurrently from two different nodes with ONE consistency
-	// to avoid quorum coordination, increasing the chance of concurrent versions.
+	// Write the same key concurrently from two different nodes. Each blind write
+	// gets a version from its own coordinator, so the two versions are concurrent.
 	key := "sibling-test-key"
 
 	var wg sync.WaitGroup
@@ -452,7 +464,7 @@ func TestSiblingPreservationOnConcurrentWrites(t *testing.T) {
 		req := &proto.PutRequest{
 			Key:              key,
 			Value:            []byte("value-from-node0"),
-			ConsistencyLevel: proto.ConsistencyLevel_ONE,
+			ConsistencyLevel: proto.ConsistencyLevel_QUORUM,
 		}
 		client.Put(ctx, req)
 	}()
@@ -463,7 +475,7 @@ func TestSiblingPreservationOnConcurrentWrites(t *testing.T) {
 		req := &proto.PutRequest{
 			Key:              key,
 			Value:            []byte("value-from-node1"),
-			ConsistencyLevel: proto.ConsistencyLevel_ONE,
+			ConsistencyLevel: proto.ConsistencyLevel_QUORUM,
 		}
 		client.Put(ctx, req)
 	}()

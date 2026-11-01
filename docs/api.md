@@ -34,7 +34,7 @@ distkv-client -consistency=all put "critical-key" "important data"
 **Parameters:**
 - `key` (string): The key to store
 - `value` (string): The value to store
-- `consistency` (optional): one, quorum, all (default: quorum)
+- `consistency` (optional): quorum or all (default: the server's W). A level needing fewer acks than W, such as one with W=2, is refused
 - `vector_clock` (optional, gRPC only): Causal context — the `vector_clock` from a previous GET or PUT of this key. The new version supersedes everything that context covers. Omit it for a blind write; the CLI always writes blind.
 
 **Response:**
@@ -57,7 +57,7 @@ distkv-client -consistency=one get "cache-key"
 
 **Parameters:**
 - `key` (string): The key to retrieve
-- `consistency` (optional): one, quorum, all (default: quorum)
+- `consistency` (optional): one, quorum, all (default: the server's R)
 
 **Response:**
 - `found` (bool): Whether key exists
@@ -97,7 +97,7 @@ distkv-client -consistency=all delete "sensitive-key"
 
 **Parameters:**
 - `key` (string): The key to delete
-- `consistency` (optional): one, quorum, all (default: quorum)
+- `consistency` (optional): as for PUT
 - `vector_clock` (optional, gRPC only): Causal context, as for PUT. A delete with the context from a GET supersedes the versions that GET returned
 
 **Response:**
@@ -205,23 +205,21 @@ message ClusterStatusResponse {
 
 ## Consistency Levels
 
-### ONE
-- **Write**: Only one replica needs to acknowledge
-- **Read**: Read from one replica only
-- **Guarantees**: High availability, eventual consistency
-- **Use case**: Caching, logs, non-critical data
+A level sets how many of the key's N replicas the coordinator waits for. A
+request without a level uses the server's R (reads) or W (writes). Writes are
+always sent to every replica; the level only changes how many acks count.
 
-### QUORUM (Default)
-- **Write**: Majority of replicas must acknowledge (W=2 out of N=3)
-- **Read**: Read from majority of replicas (R=2 out of N=3)
-- **Guarantees**: Strong consistency (W + R > N)
-- **Use case**: Most applications requiring consistency
+| Level | Replicas | Reads | Writes |
+|-------|----------|-------|--------|
+| (unset) | R or W | Default | Default |
+| ONE | 1 | Fastest; may return a stale value | Refused unless W=1 |
+| QUORUM | N/2 + 1 | With W + QUORUM > N, sees the latest acknowledged write | Refused if fewer than W |
+| ALL | N | Fails if any replica is unreachable | Fails if any replica is unreachable |
 
-### ALL  
-- **Write**: All replicas must acknowledge (W=N)
-- **Read**: Read from one replica (R=1)
-- **Guarantees**: Strongest consistency, lower availability
-- **Use case**: Critical data requiring perfect consistency
+Writes may not ask for fewer acks than W because bootstrap counts on every
+acknowledged write being on at least W replicas. Overlapping quorums give
+read-your-latest-acknowledged-write, not linearizability: read repair is
+asynchronous, and a failed write may still have reached some replicas.
 
 ## Error Handling
 
@@ -272,9 +270,9 @@ message ClusterStatusResponse {
 - Consider JSON for structured data
 
 ### Consistency
-- Use QUORUM for most operations
-- Use ONE for caches and logs
-- Use ALL only for critical operations
+- Leave the level unset for most operations
+- Use ONE for reads that can tolerate stale values, such as caches
+- Use ALL only when every replica must have the write before it is acknowledged
 
 ### Monitoring
 - Monitor cluster status regularly

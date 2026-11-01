@@ -177,7 +177,7 @@ fi
 
 ### Understanding Siblings
 
-DistKV uses Dynamo-style sibling preservation for concurrent writes. When two nodes accept writes to the same key without coordinating (e.g., during a network partition or with `ONE` consistency), the system preserves **all concurrent versions as siblings** rather than silently discarding any. The client is responsible for resolving conflicts.
+DistKV uses Dynamo-style sibling preservation for concurrent writes. When two writes to the same key are concurrent (neither was based on the other, e.g. two blind writes, or writes on both sides of a network partition), the system preserves **all concurrent versions as siblings** rather than silently discarding any. The client is responsible for resolving conflicts.
 
 ### Detecting Conflicts
 
@@ -197,7 +197,7 @@ grep "CONFLICT" /var/log/distkv/distkv.log | wc -l
 | Cause | Solution |
 |-------|----------|
 | Network partition healed with divergent writes | Application-level merge on read |
-| High write concurrency with `ONE` consistency | Use `QUORUM` consistency for writes |
+| Concurrent blind writes to the same key | Read first and pass the GET's `vector_clock` with the write |
 | Clock skew between nodes | Ensure NTP synchronization |
 | Node rejoining after prolonged downtime | Wait for anti-entropy repair to complete |
 
@@ -224,7 +224,7 @@ $ ./distkv-client put user:123 "Alice and Bob"
 
 ### Reducing Conflict Frequency
 
-- **Use `QUORUM` or `ALL` consistency** for writes to ensure coordination
+- **Write with causal context**: pass the `vector_clock` from a GET of the key; a higher consistency level does not prevent siblings
 - **Minimize partition duration** — monitor and alert on network issues
 - **Avoid writing the same key from multiple nodes simultaneously** when possible
 - **Keep NTP synchronized** to reduce the window for concurrent operations
