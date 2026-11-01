@@ -702,9 +702,9 @@ func (e *Engine) performFlush() {
 	needsCompaction := level0Count >= e.config.CompactionThreshold
 	e.mutex.Unlock()
 
-	// The flushed MemTable is now durable in an SSTable, so the sealed WAL
-	// segment that covered it is no longer needed for recovery and can be
-	// reclaimed. Writes that arrived during the flush are in the fresh active
+	// The flushed MemTable is now durable in an SSTable (CreateSSTable fsyncs
+	// the files and their directory), so the sealed WAL segment that covered
+	// it is no longer needed for recovery and can be reclaimed. Writes that arrived during the flush are in the fresh active
 	// log and are untouched.
 	if sealedWALSegment != "" {
 		if err := RemoveSegment(sealedWALSegment); err != nil {
@@ -1142,39 +1142,63 @@ func (e *Engine) walPath() string {
 // Replay tolerates a torn final record (a crash mid-append); see ReplayWAL.
 func (e *Engine) recoverWAL() error {
 	path := e.walPath()
+	rewritePath := path + ".rewrite"
+
+	// A rewrite left by a crash during an earlier recovery is incomplete or
+	// was never renamed into place; the files it was built from are intact.
+	if err := os.Remove(rewritePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove leftover WAL rewrite: %w", err)
+	}
+
+	// Sealed segments are left behind by a crash after a WAL rotation but
+	// before the corresponding SSTable was durable. They are named
+	// "<wal>.<nanos>.sealed"; sorting by name orders them oldest-first, which
+	// is the order in which their writes originally happened.
+	sealed, err := filepath.Glob(path + ".*.sealed")
+	if err != nil {
+		return fmt.Errorf("failed to list sealed WAL segments: %w", err)
+	}
+	sort.Strings(sealed)
+
+	// Replayed records go into the active MemTable, which only becomes
+	// durable at the next flush. If there are sealed segments, also copy
+	// every record, in replay order, into a fresh log, so the segments can
+	// be removed without their records existing only in memory: a second
+	// crash before that flush must still find them.
+	var rewrite *WAL
+	if len(sealed) > 0 {
+		if rewrite, err = OpenWAL(rewritePath, false); err != nil {
+			return fmt.Errorf("failed to open WAL rewrite: %w", err)
+		}
+		defer func() {
+			if rewrite != nil {
+				_ = rewrite.Close()
+				_ = os.Remove(rewritePath)
+			}
+		}()
+	}
 
 	replayInto := func(p string) (int, error) {
 		return ReplayWAL(p, func(entry *Entry) error {
 			// Insert directly into the active MemTable, bypassing Put so we don't
 			// re-append to the WAL during recovery. Later records for the same key
 			// overwrite earlier ones, matching the original write order.
+			if rewrite != nil {
+				if err := rewrite.Append(entry); err != nil {
+					return err
+				}
+			}
 			return e.activeMemTable.Put(*entry)
 		})
 	}
 
 	total := 0
-
-	// Replay any sealed segments left behind by a crash that occurred after a
-	// WAL rotation but before the corresponding SSTable was durable. They are
-	// named "<wal>.<nanos>.sealed"; sorting by name orders them oldest-first,
-	// which is the order in which their writes originally happened.
-	sealed, err := filepath.Glob(path + ".*.sealed")
-	if err != nil {
-		return fmt.Errorf("failed to list sealed WAL segments: %w", err)
-	}
-	sort.Strings(sealed)
 	for _, seg := range sealed {
 		n, err := replayInto(seg)
 		if err != nil {
 			return err
 		}
 		total += n
-		// The segment's writes are now back in the MemTable and will be
-		// re-flushed and re-logged, so the stale segment can be removed.
-		if err := RemoveSegment(seg); err != nil {
-			e.logger.WithError(err).WithField("segment", seg).
-				Warn("Failed to remove replayed sealed WAL segment")
-		}
 	}
 
 	// Replay the active log last: its writes are the most recent.
@@ -1187,6 +1211,34 @@ func (e *Engine) recoverWAL() error {
 	if total > 0 {
 		e.logger.WithField("recoveredRecords", total).
 			Info("Recovered writes from write-ahead log")
+	}
+
+	if rewrite != nil {
+		// Make the rewritten log durable, swap it in atomically, and persist
+		// the rename. A crash before the rename leaves the original files; a
+		// crash after it leaves the segments too, which replay harmlessly
+		// before the rewritten log that already contains them.
+		if err := rewrite.Sync(); err != nil {
+			return fmt.Errorf("failed to sync WAL rewrite: %w", err)
+		}
+		if err := rewrite.Close(); err != nil {
+			return fmt.Errorf("failed to close WAL rewrite: %w", err)
+		}
+		rewrite = nil
+		if err := os.Rename(rewritePath, path); err != nil {
+			return fmt.Errorf("failed to install WAL rewrite: %w", err)
+		}
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			return err
+		}
+
+		// Only now are the segments' records durable elsewhere
+		for _, seg := range sealed {
+			if err := RemoveSegment(seg); err != nil {
+				e.logger.WithError(err).WithField("segment", seg).
+					Warn("Failed to remove replayed sealed WAL segment")
+			}
+		}
 	}
 
 	// Open (or create) the log for subsequent appends. Existing records are

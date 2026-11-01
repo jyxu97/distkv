@@ -184,3 +184,14 @@ func TestIteratorMergesUnsortedMemTable(t *testing.T) {
 
 	assertNewest(t, e, keys, 2, "with an unsorted MemTable")
 }
+
+// TestSyncDir covers the directory fsync used to make new and renamed WAL and
+// SSTable files survive power loss.
+func TestSyncDir(t *testing.T) {
+	if err := syncDir(t.TempDir()); err != nil {
+		t.Fatalf("syncDir on an existing directory: %v", err)
+	}
+	if err := syncDir(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("expected an error for a missing directory")
+	}
+}

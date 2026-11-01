@@ -144,9 +144,14 @@ func CreateSSTable(memTable *MemTable, filePath string, config *StorageConfig) (
 		iterator.Next()
 	}
 
-	// Flush all data to disk
+	// Flush all data to disk. Fsync too: callers delete the WAL segment that
+	// covered this data once the SSTable exists, so it must survive power
+	// loss, not just a process crash.
 	if err := writer.Flush(); err != nil {
 		return nil, fmt.Errorf("failed to flush SSTable: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		return nil, fmt.Errorf("failed to fsync SSTable: %v", err)
 	}
 
 	// Get file size
@@ -170,6 +175,11 @@ func CreateSSTable(memTable *MemTable, filePath string, config *StorageConfig) (
 	metadataPath := filePath + ".meta"
 	if err := writeMetadata(metadata, metadataPath); err != nil {
 		return nil, fmt.Errorf("failed to write metadata: %v", err)
+	}
+
+	// Make both new files' directory entries durable
+	if err := syncDir(filepath.Dir(filePath)); err != nil {
+		return nil, err
 	}
 
 	// Create and return SSTable
@@ -305,7 +315,10 @@ func writeMetadata(metadata *SSTableMetadata, filePath string) error {
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ") // Pretty print for debugging
-	return encoder.Encode(metadata)
+	if err := encoder.Encode(metadata); err != nil {
+		return err
+	}
+	return file.Sync()
 }
 
 func readMetadata(filePath string) (*SSTableMetadata, error) {

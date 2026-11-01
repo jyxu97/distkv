@@ -80,6 +80,12 @@ func OpenWAL(path string, syncOnAppend bool) (*WAL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to open log file: %w", err)
 	}
+	// Make the file's directory entry durable; fsyncing the file alone does
+	// not guarantee a newly created file survives power loss.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("wal: %w", err)
+	}
 
 	return &WAL{
 		path:         path,
@@ -218,7 +224,28 @@ func (w *WAL) Rotate() (string, error) {
 	}
 	w.file = file
 	w.writer = bufio.NewWriter(file)
+
+	// Persist the rename and the fresh log's directory entry. Without this a
+	// power loss could undo them, losing records later appended (and fsynced)
+	// to the fresh log.
+	if err := syncDir(filepath.Dir(w.path)); err != nil {
+		return sealedPath, fmt.Errorf("wal: %w", err)
+	}
 	return sealedPath, nil
+}
+
+// syncDir fsyncs a directory so that files created, renamed or removed in it
+// survive power loss, not just their contents.
+func syncDir(dir string) error {
+	d, err := os.Open(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("failed to open directory %s for sync: %w", dir, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("failed to sync directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // RemoveSegment deletes a sealed WAL segment produced by Rotate. Call it only

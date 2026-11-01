@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -395,5 +396,143 @@ func TestEngine_PurgeMarker(t *testing.T) {
 	}
 	if entry, err := reopened.Get("purged"); err != nil || string(entry.Value) != "v2" {
 		t.Fatalf("Get after re-write = %v, %v; want v2", entry, err)
+	}
+}
+
+// TestEngine_RecoveredSegmentSurvivesSecondCrash covers a crash right after a
+// WAL rotation (the sealed segment is the only durable copy of its writes),
+// followed by a second crash before those recovered writes are flushed. The
+// first recovery must not discard the segment's records before they are
+// durable again.
+func TestEngine_RecoveredSegmentSurvivesSecondCrash(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	walPath := filepath.Join(dir, "wal.log")
+
+	first, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	v1 := consensus.NewVectorClockFromMap(map[string]uint64{"A": 1})
+	for _, key := range []string{"k1", "k2"} {
+		if err := first.Put(key, []byte("v1"), v1); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+	}
+	first.CrashForTesting()
+
+	// Crash right after rotation: the records sit in a sealed segment and no
+	// SSTable holds them yet
+	if err := os.Rename(walPath, walPath+".1.sealed"); err != nil {
+		t.Fatalf("simulate rotation: %v", err)
+	}
+
+	// First recovery, then a newer write to k2, then a second crash before any flush
+	second, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("first recovery: %v", err)
+	}
+	v2 := consensus.NewVectorClockFromMap(map[string]uint64{"A": 2})
+	if err := second.Put("k2", []byte("v2"), v2); err != nil {
+		t.Fatalf("Put after recovery: %v", err)
+	}
+	second.CrashForTesting()
+
+	third, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("second recovery: %v", err)
+	}
+	defer third.Close()
+	for key, want := range map[string]string{"k1": "v1", "k2": "v2"} {
+		entry, err := third.Get(key)
+		if err != nil || string(entry.Value) != want {
+			t.Fatalf("after second crash %s = %v (%v), want %s", key, entry, err, want)
+		}
+	}
+}
+
+// TestEngine_RecoveryIgnoresIncompleteRewrite covers a crash while recovery
+// was rewriting the log: the leftover temporary file must be ignored and the
+// original segment and log recovered.
+func TestEngine_RecoveryIgnoresIncompleteRewrite(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	walPath := filepath.Join(dir, "wal.log")
+
+	first, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	vc := consensus.NewVectorClockFromMap(map[string]uint64{"A": 1})
+	if err := first.Put("k", []byte("v"), vc); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	first.CrashForTesting()
+	if err := os.Rename(walPath, walPath+".1.sealed"); err != nil {
+		t.Fatalf("simulate rotation: %v", err)
+	}
+	if err := os.WriteFile(walPath+".rewrite", []byte("torn garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("recovery with leftover rewrite file: %v", err)
+	}
+	defer recovered.Close()
+	if entry, err := recovered.Get("k"); err != nil || string(entry.Value) != "v" {
+		t.Fatalf("k = %v (%v), want v", entry, err)
+	}
+}
+
+// TestEngine_RecoveryCrashBeforeSegmentRemoval covers a crash after the
+// rewritten log was installed but before the sealed segment was removed: the
+// segment then replays before a log that already contains its records, which
+// must still end with the newest values.
+func TestEngine_RecoveryCrashBeforeSegmentRemoval(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	walPath := filepath.Join(dir, "wal.log")
+	segment := walPath + ".1.sealed"
+
+	first, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	v1 := consensus.NewVectorClockFromMap(map[string]uint64{"A": 1})
+	if err := first.Put("k", []byte("v1"), v1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	first.CrashForTesting()
+	if err := os.Rename(walPath, segment); err != nil {
+		t.Fatalf("simulate rotation: %v", err)
+	}
+	segmentCopy, err := os.ReadFile(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("recovery: %v", err)
+	}
+	if _, err := os.Stat(segment); !os.IsNotExist(err) {
+		t.Fatalf("sealed segment still present after recovery made it durable: %v", err)
+	}
+	v2 := consensus.NewVectorClockFromMap(map[string]uint64{"A": 2})
+	if err := second.Put("k", []byte("v2"), v2); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	second.CrashForTesting()
+
+	// As if the crash had hit before the segment was removed
+	if err := os.WriteFile(segment, segmentCopy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	third, err := storage.NewEngine(dir, walConfig())
+	if err != nil {
+		t.Fatalf("recovery with a leftover segment: %v", err)
+	}
+	defer third.Close()
+	if entry, err := third.Get("k"); err != nil || string(entry.Value) != "v2" {
+		t.Fatalf("k = %v (%v), want v2", entry, err)
 	}
 }
