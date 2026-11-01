@@ -6,6 +6,7 @@ package storage
 import (
 	"container/heap"
 	"fmt"
+	"sort"
 )
 
 // MemTableIterator iterates through entries in a MemTable in sorted order.
@@ -81,8 +82,10 @@ func NewSSTableIterator(sstable *SSTable) *SSTableIterator {
 		keys = append(keys, key)
 	}
 
-	// Keys should already be sorted in our implementation, but ensure it
-	// sort.Strings(keys) // Commented out since our index maintains sorted order
+	// The index is a map, so its iteration order is random. The merge
+	// iterator requires every source in key order; without this sort it emits
+	// a key more than once and compaction keeps whichever version comes last.
+	sort.Strings(keys)
 
 	return &SSTableIterator{
 		sstable: sstable,
@@ -162,9 +165,19 @@ type heapItem struct {
 // iteratorHeap implements heap.Interface for merging sorted iterators.
 type iteratorHeap []*heapItem
 
-func (h iteratorHeap) Len() int           { return len(h) }
-func (h iteratorHeap) Less(i, j int) bool { return h[i].key < h[j].key }
-func (h iteratorHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h iteratorHeap) Len() int { return len(h) }
+
+// Less orders by key, and for equal keys by source index: sources are passed
+// newest first, so the lowest index holds the newest version of a key and
+// must be popped first. Ordering by key alone left the choice to heap layout,
+// which returned stale versions to iteration and compaction.
+func (h iteratorHeap) Less(i, j int) bool {
+	if h[i].key != h[j].key {
+		return h[i].key < h[j].key
+	}
+	return h[i].index < h[j].index
+}
+func (h iteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
 func (h *iteratorHeap) Push(x interface{}) {
 	*h = append(*h, x.(*heapItem))
@@ -316,9 +329,9 @@ func NewEngineIterator(engine *Engine) (*EngineIterator, error) {
 		iterators = append(iterators, NewMemTableIterator(engine.activeMemTable))
 	}
 
-	// Add flushing MemTable iterators
-	for _, memTable := range engine.flushingMemTables {
-		iterators = append(iterators, NewMemTableIterator(memTable))
+	// Add flushing MemTable iterators, newest first
+	for i := len(engine.flushingMemTables) - 1; i >= 0; i-- {
+		iterators = append(iterators, NewMemTableIterator(engine.flushingMemTables[i]))
 	}
 
 	// Add SSTable iterators (newest level/files first for proper conflict resolution)

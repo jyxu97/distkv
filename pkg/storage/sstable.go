@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -36,6 +35,11 @@ type SSTable struct {
 
 	// level indicates which compaction level this SSTable belongs to (0 = newest)
 	level int
+
+	// gen orders tables by how recent their data is: a flushed table gets the
+	// generation of its MemTable, a compaction output that of its newest
+	// input. Within a level a higher generation holds newer versions.
+	gen uint64
 
 	// mutex protects concurrent access to the SSTable
 	mutex sync.RWMutex
@@ -226,21 +230,18 @@ func (sst *SSTable) Get(key string) (*Entry, error) {
 		return nil, ErrKeyNotFound
 	}
 
-	// Seek to the entry position
-	if _, err := sst.file.Seek(offset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to entry: %v", err)
-	}
-
-	// Read entry size
+	// Read with positional reads: callers share the file handle under a read
+	// lock, so Seek followed by Read would race on the file offset and return
+	// bytes from another entry.
 	sizeBytes := make([]byte, 4)
-	if _, err := io.ReadFull(sst.file, sizeBytes); err != nil {
+	if _, err := sst.file.ReadAt(sizeBytes, offset); err != nil {
 		return nil, fmt.Errorf("failed to read entry size: %v", err)
 	}
 	entrySize := binary.LittleEndian.Uint32(sizeBytes)
 
 	// Read entry data
 	entryData := make([]byte, entrySize)
-	if _, err := io.ReadFull(sst.file, entryData); err != nil {
+	if _, err := sst.file.ReadAt(entryData, offset+4); err != nil {
 		return nil, fmt.Errorf("failed to read entry data: %v", err)
 	}
 

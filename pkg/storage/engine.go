@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,6 +49,10 @@ type Engine struct {
 
 	// wg tracks background goroutines
 	wg sync.WaitGroup
+
+	// nextGen is the generation for the next MemTable flushed to an SSTable.
+	// Guarded by mutex.
+	nextGen uint64
 
 	// stats tracks performance metrics
 	stats *StorageStats
@@ -358,9 +364,9 @@ func (e *Engine) lookupLocked(key string) (*Entry, bool, error) {
 		return entry, true, nil
 	}
 
-	// Check flushing MemTables
-	for _, memTable := range e.flushingMemTables {
-		if entry := memTable.Get(key); entry != nil {
+	// Check flushing MemTables, newest first
+	for i := len(e.flushingMemTables) - 1; i >= 0; i-- {
+		if entry := e.flushingMemTables[i].Get(key); entry != nil {
 			return entry, true, nil
 		}
 	}
@@ -474,8 +480,8 @@ func (e *Engine) Close() error {
 			e.logger.WithError(err).Error("Failed to create sstables directory during shutdown")
 			shutdownErrors = append(shutdownErrors, err)
 		}
-		timestamp := time.Now().UnixNano()
-		fileName := fmt.Sprintf("sstable_final_%d.db", timestamp)
+		fileName := fmt.Sprintf("sstable_%d.db", e.nextGen)
+		e.nextGen++
 		filePath := filepath.Join(sstablesDir, fileName)
 
 		if _, err := CreateSSTable(flushingMemTable, filePath, e.config); err != nil {
@@ -610,10 +616,13 @@ func (e *Engine) performFlush() {
 
 	e.mutex.Lock()
 
-	// Move active MemTable to flushing list
+	// Move active MemTable to flushing list. Its generation is fixed now, at
+	// rotation, so tables stay in data order even if flushes finish out of order.
 	flushingMemTable := e.activeMemTable
 	flushingMemTable.SetReadOnly()
 	e.flushingMemTables = append(e.flushingMemTables, flushingMemTable)
+	gen := e.nextGen
+	e.nextGen++
 
 	// Create new active MemTable
 	e.activeMemTable = NewMemTable()
@@ -645,9 +654,8 @@ func (e *Engine) performFlush() {
 		return
 	}
 
-	// Generate SSTable file path
-	timestamp := time.Now().UnixNano()
-	fileName := fmt.Sprintf("sstable_%d.db", timestamp)
+	// Generate SSTable file path; the name records the generation for reload
+	fileName := fmt.Sprintf("sstable_%d.db", gen)
 	filePath := filepath.Join(sstablesDir, fileName)
 
 	// Create SSTable from MemTable
@@ -659,10 +667,11 @@ func (e *Engine) performFlush() {
 		return
 	}
 
-	// Add SSTable to level 0 (newest level)
+	// Add SSTable to level 0 (newest level), in generation order
 	e.mutex.Lock()
 	sstable.level = 0
-	e.sstables[0] = append(e.sstables[0], sstable)
+	sstable.gen = gen
+	e.sstables[0] = insertByGen(e.sstables[0], sstable)
 
 	totalSSTables := 0
 	for level := range e.sstables {
@@ -763,8 +772,9 @@ func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
 
 	e.mutex.Unlock()
 
-	// Compact the selected tables
-	allTables := append(sourceTables, targetTables...)
+	// Compact the selected tables, newest first: the source level is newer
+	// than the target level, and within a level later tables are newer
+	allTables := append(newestFirst(sourceTables), newestFirst(targetTables)...)
 	newSSTables, err := e.compactSSTablesForLevel(allTables, targetLevel)
 	if err != nil {
 		e.logger.WithError(err).Error("Level-based compaction failed")
@@ -782,8 +792,10 @@ func (e *Engine) performLevelBasedCompaction(tracker *metrics.LatencyTracker) {
 	// Remove compacted tables from target level
 	e.sstables[targetLevel] = e.removeCompactedTables(e.sstables[targetLevel], targetTables)
 
-	// Add new tables to target level
-	e.sstables[targetLevel] = append(e.sstables[targetLevel], newSSTables...)
+	// Add new tables to target level, in generation order
+	for _, table := range newSSTables {
+		e.sstables[targetLevel] = insertByGen(e.sstables[targetLevel], table)
+	}
 
 	// Update metrics
 	totalSSTables := 0
@@ -824,8 +836,8 @@ func (e *Engine) performSimpleCompaction(tracker *metrics.LatencyTracker) {
 
 	e.mutex.Unlock()
 
-	// Perform compaction
-	newSSTables, err := e.compactSSTablesForLevel(tablesToCompact, 0)
+	// Perform compaction (later tables in a level are newer)
+	newSSTables, err := e.compactSSTablesForLevel(newestFirst(tablesToCompact), 0)
 	if err != nil {
 		e.logger.WithError(err).Error("Simple compaction failed")
 		e.metrics.Storage().CompactionErrors.Add(1)
@@ -836,7 +848,14 @@ func (e *Engine) performSimpleCompaction(tracker *metrics.LatencyTracker) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
-	e.sstables[0] = newSSTables
+	// Keep tables flushed while compaction ran, and place the output by
+	// generation: it holds data no newer than its newest input, so tables
+	// flushed meanwhile stay ahead of it
+	level0 := e.removeCompactedTables(e.sstables[0], tablesToCompact)
+	for _, table := range newSSTables {
+		level0 = insertByGen(level0, table)
+	}
+	e.sstables[0] = level0
 
 	totalSSTables := 0
 	for level := range e.sstables {
@@ -925,6 +944,18 @@ func (e *Engine) removeCompactedTables(allTables []*SSTable, toRemove []*SSTable
 }
 
 // compactSSTablesForLevel merges multiple SSTables into new SSTables for a specific level.
+// newestFirst returns a level's tables in reverse order: tables are appended
+// as they are created, so the last one is the newest.
+func newestFirst(tables []*SSTable) []*SSTable {
+	reversed := make([]*SSTable, len(tables))
+	for i, table := range tables {
+		reversed[len(tables)-1-i] = table
+	}
+	return reversed
+}
+
+// compactSSTablesForLevel merges tables, which must be ordered newest first,
+// keeping only the newest version of each key.
 func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]*SSTable, error) {
 	if len(tables) == 0 {
 		return nil, errors.New(errors.ErrCodeInternal, "no SSTables to compact")
@@ -934,8 +965,12 @@ func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]
 
 	// Create iterators for all SSTables
 	iterators := make([]Iterator, len(tables))
+	var gen uint64
 	for i, table := range tables {
 		iterators[i] = NewSSTableIterator(table)
+		if table.gen > gen {
+			gen = table.gen
+		}
 	}
 
 	// Create merge iterator
@@ -976,7 +1011,7 @@ func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]
 
 		// Check if we need to flush this MemTable to a new SSTable
 		if tempMemTable.Size() >= maxSSTableSize {
-			newSSTable, err := e.flushCompactedMemTable(tempMemTable, targetLevel)
+			newSSTable, err := e.flushCompactedMemTable(tempMemTable, targetLevel, gen)
 			if err != nil {
 				return nil, err
 			}
@@ -989,7 +1024,7 @@ func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]
 
 	// Flush remaining data
 	if tempMemTable.Size() > 0 {
-		newSSTable, err := e.flushCompactedMemTable(tempMemTable, targetLevel)
+		newSSTable, err := e.flushCompactedMemTable(tempMemTable, targetLevel, gen)
 		if err != nil {
 			return nil, err
 		}
@@ -1006,11 +1041,13 @@ func (e *Engine) compactSSTablesForLevel(tables []*SSTable, targetLevel int) ([]
 	return newSSTables, nil
 }
 
-// flushCompactedMemTable creates an SSTable from a compacted MemTable.
-func (e *Engine) flushCompactedMemTable(memTable *MemTable, level int) (*SSTable, error) {
+// flushCompactedMemTable creates an SSTable from a compacted MemTable. The
+// output takes gen, the generation of the newest input table, so it sorts
+// before any table flushed while the compaction ran.
+func (e *Engine) flushCompactedMemTable(memTable *MemTable, level int, gen uint64) (*SSTable, error) {
 	timestamp := time.Now().UnixNano()
 	compactedPath := filepath.Join(e.dataDir, "sstables",
-		fmt.Sprintf("compacted_L%d_%d.db", level, timestamp))
+		fmt.Sprintf("compacted_L%d_g%d_%d.db", level, gen, timestamp))
 
 	newSSTable, err := CreateSSTable(memTable, compactedPath, e.config)
 	if err != nil {
@@ -1020,6 +1057,7 @@ func (e *Engine) flushCompactedMemTable(memTable *MemTable, level int) (*SSTable
 	}
 
 	newSSTable.level = level
+	newSSTable.gen = gen
 	return newSSTable, nil
 }
 
@@ -1169,14 +1207,47 @@ func (e *Engine) loadExistingSSTables() error {
 			continue
 		}
 
-		// Add to appropriate level
+		sstable.gen = parseSSTableGen(filepath.Base(filePath))
+		if sstable.gen >= e.nextGen {
+			e.nextGen = sstable.gen + 1
+		}
+
+		// Add to appropriate level, in generation order
 		level := sstable.level
 		if level < 0 || level >= len(e.sstables) {
 			e.logger.WithField("level", level).Warn("Invalid SSTable level, adding to level 0")
 			level = 0
 		}
-		e.sstables[level] = append(e.sstables[level], sstable)
+		e.sstables[level] = insertByGen(e.sstables[level], sstable)
 	}
 
 	return nil
+}
+
+// parseSSTableGen extracts the generation from an SSTable file name:
+// sstable_<gen>.db or compacted_L<level>_g<gen>_<nanos>.db. Files written
+// before generations existed (sstable_<nanos>.db, sstable_final_<nanos>.db,
+// compacted_L<level>_<nanos>.db) use their creation time, which keeps their
+// previous relative order; new generations continue above them.
+func parseSSTableGen(name string) uint64 {
+	name = strings.TrimSuffix(name, ".db")
+	parts := strings.Split(name, "_")
+	for i, part := range parts {
+		if strings.HasPrefix(part, "g") && i > 0 && strings.HasPrefix(parts[0], "compacted") {
+			if gen, err := strconv.ParseUint(part[1:], 10, 64); err == nil {
+				return gen
+			}
+		}
+	}
+	gen, _ := strconv.ParseUint(parts[len(parts)-1], 10, 64)
+	return gen
+}
+
+// insertByGen inserts table into a level kept sorted by generation, oldest first.
+func insertByGen(tables []*SSTable, table *SSTable) []*SSTable {
+	i := sort.Search(len(tables), func(i int) bool { return tables[i].gen > table.gen })
+	tables = append(tables, nil)
+	copy(tables[i+1:], tables[i:])
+	tables[i] = table
+	return tables
 }
