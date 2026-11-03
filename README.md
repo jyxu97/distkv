@@ -231,7 +231,7 @@ The `ConsistencyLevel` enum's zero value is `DEFAULT` (ONE = 1, QUORUM = 2, ALL 
 # Default: N=3, R=2, W=2
 ./build/distkv-server -node-id=node1 -replicas=3 -read-quorum=2 -write-quorum=2
 ```
-Every read quorum overlaps the replicas that acknowledged the latest successful write, so a read sees that write or a newer version. This is not linearizability: read repair is asynchronous, a write that fails can still have reached some replicas, and concurrent writes surface as siblings.
+With a stable replica set, every read quorum overlaps the replicas that acknowledged the latest successful write, so a read sees that write or a newer version. This is not linearizability: read repair is asynchronous, a write that fails can still have reached some replicas, and concurrent writes surface as siblings.
 
 ### Eventual Consistency (R + W ≤ N)
 ```bash

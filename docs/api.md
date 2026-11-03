@@ -213,7 +213,7 @@ always sent to every replica; the level only changes how many acks count.
 |-------|----------|-------|--------|
 | (unset) | R or W | Default | Default |
 | ONE | 1 | Fastest; may return a stale value | Refused unless W=1 |
-| QUORUM | N/2 + 1 | With W + QUORUM > N, sees the latest acknowledged write | Refused if fewer than W |
+| QUORUM | N/2 + 1 | With W + QUORUM > N and a stable replica set, sees the latest acknowledged write | Refused if fewer than W |
 | ALL | N | Fails if any replica is unreachable | Fails if any replica is unreachable |
 
 Writes may not ask for fewer acks than W because bootstrap counts on every

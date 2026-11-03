@@ -37,7 +37,9 @@ type QuorumConfig struct {
 }
 
 // DefaultQuorumConfig returns the default configuration from the design document.
-// N=3, W=2, R=2 provides strong consistency when W + R > N
+// N=3, W=2, R=2 satisfies W + R > N: under stable replica membership, every
+// read quorum overlaps every write quorum. That is not linearizability (see
+// HasReadWriteQuorumOverlap).
 func DefaultQuorumConfig() *QuorumConfig {
 	return &QuorumConfig{
 		N:              3,               // Store 3 copies of each key
@@ -66,9 +68,12 @@ func (qc *QuorumConfig) Validate() error {
 	return nil
 }
 
-// IsStrongConsistency returns true if the configuration guarantees strong consistency.
-// This happens when W + R > N, ensuring read and write quorums overlap.
-func (qc *QuorumConfig) IsStrongConsistency() bool {
+// HasReadWriteQuorumOverlap reports whether W + R > N, so that for a fixed
+// replica set every read quorum shares at least one replica with every write
+// quorum. Overlap alone does not make reads linearizable: read repair is
+// asynchronous, a failed write may still have reached some replicas, and
+// concurrent writes are kept as siblings.
+func (qc *QuorumConfig) HasReadWriteQuorumOverlap() bool {
 	return qc.W+qc.R > qc.N
 }
 

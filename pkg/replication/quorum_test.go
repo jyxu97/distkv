@@ -162,8 +162,8 @@ func TestDefaultQuorumConfig(t *testing.T) {
 		t.Errorf("Expected W=2, got %d", config.W)
 	}
 
-	if !config.IsStrongConsistency() {
-		t.Error("Default config should provide strong consistency (W+R > N)")
+	if !config.HasReadWriteQuorumOverlap() {
+		t.Error("Default config should have overlapping read and write quorums (W+R > N)")
 	}
 }
 
@@ -219,25 +219,25 @@ func TestQuorumConfigValidate(t *testing.T) {
 	}
 }
 
-// TestIsStrongConsistency tests strong consistency detection
-func TestIsStrongConsistency(t *testing.T) {
+// TestHasReadWriteQuorumOverlap tests detection of overlapping read and write quorums
+func TestHasReadWriteQuorumOverlap(t *testing.T) {
 	tests := []struct {
 		name     string
 		N, R, W  int
 		expected bool
 	}{
-		{"Strong (W+R > N)", 3, 2, 2, true},
-		{"Strong (W+R > N) variant", 5, 3, 3, true},
-		{"Weak (W+R = N)", 3, 2, 1, false},
-		{"Weak (W+R < N)", 5, 2, 2, false},
+		{"Overlap (W+R > N)", 3, 2, 2, true},
+		{"Overlap (W+R > N) variant", 5, 3, 3, true},
+		{"No overlap (W+R = N)", 3, 2, 1, false},
+		{"No overlap (W+R < N)", 5, 2, 2, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			config := &QuorumConfig{N: tt.N, R: tt.R, W: tt.W,
 				RequestTimeout: 5 * time.Second, RetryAttempts: 3, RetryDelay: 100 * time.Millisecond}
-			if config.IsStrongConsistency() != tt.expected {
-				t.Errorf("Expected %v, got %v", tt.expected, config.IsStrongConsistency())
+			if config.HasReadWriteQuorumOverlap() != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, config.HasReadWriteQuorumOverlap())
 			}
 		})
 	}
