@@ -226,21 +226,9 @@ func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *E
 		}
 	}
 
-	// Durability: append to the write-ahead log and fsync BEFORE inserting into
-	// the MemTable. If we crash after this returns, the write is recoverable on
-	// restart; if the append fails, we reject the write rather than acknowledge
-	// something we can't recover. This is what makes an ack'd write survive a crash.
-	if e.wal != nil {
-		if err := e.wal.Append(entry); err != nil {
-			e.mutex.Unlock()
-			e.stats.WriteErrors++
-			e.metrics.Storage().WriteErrors.Add(1)
-			e.logger.WithError(err).WithField("key", key).Error("Failed to append to WAL")
-			return false, current, errors.Wrap(err, errors.ErrCodeInternal, "failed to append to WAL")
-		}
-	}
-
-	// Estimate memory usage and check limits
+	// Estimate memory usage and check limits. This comes before the WAL: a
+	// write refused here must not be in the log, or recovery would apply a
+	// write the caller was told had failed.
 	estimatedSize := int64(len(key) + len(entry.Value) + 64) // Rough estimate
 	if err := e.memoryMonitor.RecordMemTableAllocation(estimatedSize); err != nil {
 		e.stats.WriteErrors++
@@ -249,6 +237,21 @@ func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *E
 		e.logger.WithError(err).WithField("estimatedSize", estimatedSize).
 			Error("Memory limit exceeded, cannot write entry")
 		return false, current, err
+	}
+
+	// Durability: append to the write-ahead log and fsync BEFORE inserting into
+	// the MemTable. If we crash after this returns, the write is recoverable on
+	// restart; if the append fails, we reject the write rather than acknowledge
+	// something we can't recover. This is what makes an ack'd write survive a crash.
+	if e.wal != nil {
+		if err := e.wal.Append(entry); err != nil {
+			e.memoryMonitor.RecordMemTableDeallocation(estimatedSize)
+			e.mutex.Unlock()
+			e.stats.WriteErrors++
+			e.metrics.Storage().WriteErrors.Add(1)
+			e.logger.WithError(err).WithField("key", key).Error("Failed to append to WAL")
+			return false, current, errors.Wrap(err, errors.ErrCodeInternal, "failed to append to WAL")
+		}
 	}
 
 	// Add to active MemTable
@@ -261,6 +264,7 @@ func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *E
 		e.logger.WithError(err).WithField("key", key).Error("Failed to put entry to MemTable")
 		return false, current, errors.Wrap(err, errors.ErrCodeInternal, "failed to put entry to MemTable")
 	}
+	e.activeMemTable.accounted += estimatedSize
 
 	// Update stats and metrics
 	e.stats.WriteCount++
@@ -690,13 +694,15 @@ func (e *Engine) performFlush() {
 	}
 	e.metrics.Storage().SSTableCount.Store(int64(totalSSTables))
 
-	// Remove from flushing list
+	// Remove from flushing list; its data now lives on disk, so its memory no
+	// longer counts against the MemTable limit
 	for i, mt := range e.flushingMemTables {
 		if mt == flushingMemTable {
 			e.flushingMemTables = append(e.flushingMemTables[:i], e.flushingMemTables[i+1:]...)
 			break
 		}
 	}
+	e.memoryMonitor.RecordMemTableDeallocation(flushingMemTable.accounted)
 
 	level0Count := len(e.sstables[0])
 	needsCompaction := level0Count >= e.config.CompactionThreshold

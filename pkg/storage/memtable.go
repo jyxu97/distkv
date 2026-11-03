@@ -27,6 +27,11 @@ type MemTable struct {
 
 	// readOnly indicates if this MemTable is being flushed (no more writes)
 	readOnly bool
+
+	// accounted is how many bytes the engine recorded with its memory monitor
+	// for this table, released once the table is flushed. Guarded by the
+	// engine's mutex, not by mutex.
+	accounted int64
 }
 
 // NewMemTable creates a new empty MemTable.

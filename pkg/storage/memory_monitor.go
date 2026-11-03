@@ -121,13 +121,15 @@ func NewMemoryMonitor(config *MemoryConfig) *MemoryMonitor {
 	return monitor
 }
 
-// RecordMemTableAllocation records memory allocated for a MemTable.
+// RecordMemTableAllocation records memory allocated for a MemTable. If that
+// would exceed a limit, it records nothing and returns ErrMemoryLimitExceeded.
 func (m *MemoryMonitor) RecordMemTableAllocation(bytes int64) error {
 	newUsage := m.memTableUsage.Add(bytes)
 	m.currentUsage.Add(bytes)
 
 	// Check if we exceed MemTable limit
 	if m.config.MaxMemTableMemory > 0 && newUsage > m.config.MaxMemTableMemory {
+		m.RecordMemTableDeallocation(bytes)
 		m.logger.WithFields(map[string]interface{}{
 			"current": newUsage,
 			"limit":   m.config.MaxMemTableMemory,
@@ -137,6 +139,7 @@ func (m *MemoryMonitor) RecordMemTableAllocation(bytes int64) error {
 
 	// Check total memory limit
 	if err := m.checkTotalMemoryLimit(); err != nil {
+		m.RecordMemTableDeallocation(bytes)
 		return err
 	}
 
