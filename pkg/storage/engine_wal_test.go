@@ -450,9 +450,9 @@ func TestEngine_RecoveredSegmentSurvivesSecondCrash(t *testing.T) {
 	}
 }
 
-// TestEngine_RecoveryIgnoresIncompleteRewrite covers a crash while recovery
-// was rewriting the log: the leftover temporary file must be ignored and the
-// original segment and log recovered.
+// TestEngine_RecoveryIgnoresIncompleteRewrite covers a temporary file left by
+// an older version's recovery, which rewrote the log: it must be ignored and
+// the original segment and log recovered.
 func TestEngine_RecoveryIgnoresIncompleteRewrite(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	walPath := filepath.Join(dir, "wal.log")
@@ -483,10 +483,10 @@ func TestEngine_RecoveryIgnoresIncompleteRewrite(t *testing.T) {
 	}
 }
 
-// TestEngine_RecoveryCrashBeforeSegmentRemoval covers a crash after the
-// rewritten log was installed but before the sealed segment was removed: the
-// segment then replays before a log that already contains its records, which
-// must still end with the newest values.
+// TestEngine_RecoveryCrashBeforeSegmentRemoval covers a crash after recovery
+// wrote a sealed segment to an SSTable but before it removed the segment: the
+// next recovery writes it again, and newer writes in the log must still win.
+// The segment has the name format of older versions, without a generation.
 func TestEngine_RecoveryCrashBeforeSegmentRemoval(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	walPath := filepath.Join(dir, "wal.log")

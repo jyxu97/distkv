@@ -240,12 +240,12 @@ func TestWAL_Rotate(t *testing.T) {
 	w, _ := OpenWAL(path, true)
 	_ = w.Append(mkEntry("old", "1", "node1"))
 
-	sealed, err := w.Rotate()
+	sealed, err := w.Rotate(7)
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
-	if sealed == "" {
-		t.Fatal("Rotate returned empty sealed path")
+	if gen, ok := parseSealedSegmentGen(path, sealed); !ok || gen != 7 {
+		t.Fatalf("Rotate(7) sealed %q, which names generation %d (ok=%v)", sealed, gen, ok)
 	}
 	_ = w.Append(mkEntry("new", "2", "node1"))
 	_ = w.Close()

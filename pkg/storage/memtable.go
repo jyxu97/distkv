@@ -32,6 +32,12 @@ type MemTable struct {
 	// for this table, released once the table is flushed. Guarded by the
 	// engine's mutex, not by mutex.
 	accounted int64
+
+	// gen and walSegment are set when the engine seals this table for
+	// flushing: the generation its SSTable gets, and the sealed WAL segment
+	// holding its writes ("" if there is none). Guarded by the engine's mutex.
+	gen        uint64
+	walSegment string
 }
 
 // NewMemTable creates a new empty MemTable.

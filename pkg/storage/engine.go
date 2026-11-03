@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"bytes"
 	"distkv/pkg/consensus"
 	"distkv/pkg/errors"
 	"distkv/pkg/logging"
@@ -29,8 +30,34 @@ type Engine struct {
 	// activeMemTable receives all new writes
 	activeMemTable *MemTable
 
-	// flushingMemTables are being written to disk (read-only)
+	// flushingMemTables are sealed, read-only MemTables waiting to be written
+	// to disk, oldest first. The flush worker writes them in this order, so a
+	// MemTable never outlives a newer one: reads search them newest first,
+	// ahead of every SSTable.
 	flushingMemTables []*MemTable
+
+	// flushCond is signalled (with mutex) whenever a flush finishes or fails
+	// and when the engine closes. Writers held back by backpressure wait on it.
+	flushCond *sync.Cond
+
+	// flushErr is the error of the last flush attempt if it failed, nil once
+	// a flush succeeds. While set, writes that would have to wait for a
+	// flush fail instead of waiting for a retry that may never succeed.
+	flushErr error
+
+	// stalledWriters counts writers waiting on flushCond (for tests and stats)
+	stalledWriters int
+
+	// createSSTable writes a MemTable to an SSTable file. A field so tests
+	// can delay or fail flushes.
+	createSSTable func(memTable *MemTable, path string) (*SSTable, error)
+
+	// flushRetryMin and flushRetryMax bound the delay between attempts to
+	// flush a MemTable whose flush failed; the delay doubles per failure.
+	flushRetryMin, flushRetryMax time.Duration
+
+	// crashed makes the flush worker stop without flushing (CrashForTesting)
+	crashed bool
 
 	// sstables contains all disk-based storage files organized by level
 	sstables [][]*SSTable
@@ -138,6 +165,12 @@ func NewEngine(dataDir string, config *StorageConfig) (*Engine, error) {
 		logger:            logger,
 		metrics:           metrics.GetGlobalMetrics(),
 		memoryMonitor:     memoryMonitor,
+		flushRetryMin:     100 * time.Millisecond,
+		flushRetryMax:     10 * time.Second,
+	}
+	engine.flushCond = sync.NewCond(&engine.mutex)
+	engine.createSSTable = func(memTable *MemTable, path string) (*SSTable, error) {
+		return CreateSSTable(memTable, path, config)
 	}
 
 	// Load existing SSTables from disk
@@ -157,6 +190,7 @@ func NewEngine(dataDir string, config *StorageConfig) (*Engine, error) {
 				"failed to recover write-ahead log").WithContext("dataDir", dataDir)
 		}
 	}
+	engine.flattenLevelsIfOutOfOrder()
 
 	// Start background workers
 	engine.startBackgroundWorkers()
@@ -203,12 +237,26 @@ func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *E
 		return false, nil, errors.New(errors.ErrCodeInvalidKey, "key cannot be empty")
 	}
 
+	// The MemTable keeps the entry after this returns, and the flush worker
+	// encodes it later, so it must not share the caller's value or clock
+	stored := *entry
+	stored.Value = bytes.Clone(entry.Value)
+	if entry.VectorClock != nil {
+		stored.VectorClock = entry.VectorClock.Copy()
+	}
+	entry = &stored
+
 	e.mutex.Lock()
 
 	if e.closed {
 		e.mutex.Unlock()
 		e.metrics.Storage().WriteErrors.Add(1)
 		return false, nil, errors.NewStorageClosedError()
+	}
+	if err := e.waitForMemTableRoomLocked(); err != nil {
+		e.mutex.Unlock()
+		e.metrics.Storage().WriteErrors.Add(1)
+		return false, nil, err
 	}
 
 	var current *Entry
@@ -270,25 +318,12 @@ func (e *Engine) WriteIf(entry *Entry, cond func(current *Entry) bool) (bool, *E
 	e.stats.WriteCount++
 	e.metrics.Storage().WriteOps.Add(1)
 
-	memTableSize := e.activeMemTable.Size()
-	e.metrics.Storage().MemTableSize.Store(memTableSize)
+	e.metrics.Storage().MemTableSize.Store(e.activeMemTable.Size())
 
-	// Check if MemTable needs to be flushed
-	needsFlush := memTableSize >= int64(e.config.MemTableMaxSize)
-	if needsFlush {
-		e.logger.WithFields(map[string]interface{}{
-			"memTableSize": memTableSize,
-			"threshold":    e.config.MemTableMaxSize,
-		}).Info("MemTable threshold reached, triggering flush")
-	}
-
-	// Release the mutex before flushing to avoid deadlock
+	// Hand a full MemTable to the flush worker; this write does not wait for
+	// the flush
+	e.maybeSealLocked()
 	e.mutex.Unlock()
-
-	if needsFlush {
-		// For testing: force synchronous flush
-		e.performFlush()
-	}
 
 	return true, current, nil
 }
@@ -452,6 +487,13 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	e.closed = true
+
+	// Queue the remaining writes for the flush worker, which drains its queue
+	// before stopping, and release writers held back by backpressure
+	if e.activeMemTable.Size() > 0 {
+		e.sealLocked()
+	}
+	e.flushCond.Broadcast()
 	e.mutex.Unlock()
 
 	var shutdownErrors []error
@@ -480,42 +522,19 @@ func (e *Engine) Close() error {
 	e.logger.Debug("Stopping memory monitor")
 	e.memoryMonitor.Stop()
 
-	// Flush any remaining data in active MemTable
+	// A MemTable the worker could not flush keeps its writes in its sealed
+	// WAL segment, which the next startup recovers
 	e.mutex.Lock()
-	if e.activeMemTable.Size() > 0 {
-		e.logger.WithField("memTableSize", e.activeMemTable.Size()).
-			Info("Flushing remaining MemTable data")
-		flushingMemTable := e.activeMemTable
-		flushingMemTable.SetReadOnly()
-		e.mutex.Unlock()
-
-		// Perform final flush
-		sstablesDir := filepath.Join(e.dataDir, "sstables")
-		if err := os.MkdirAll(sstablesDir, 0755); err != nil {
-			e.logger.WithError(err).Error("Failed to create sstables directory during shutdown")
-			shutdownErrors = append(shutdownErrors, err)
+	if unflushed := len(e.flushingMemTables); unflushed > 0 {
+		lost := "they are recovered from the WAL on the next start"
+		if e.wal == nil {
+			lost = "their writes are lost because the WAL is disabled"
 		}
-		fileName := fmt.Sprintf("sstable_%d.db", e.nextGen)
-		e.nextGen++
-		filePath := filepath.Join(sstablesDir, fileName)
-
-		if _, err := CreateSSTable(flushingMemTable, filePath, e.config); err != nil {
-			e.logger.WithError(err).Error("Failed to flush final MemTable")
-			shutdownErrors = append(shutdownErrors, err)
-		} else {
-			e.logger.Info("Final MemTable flushed successfully")
-			// The remaining data is now durable in an SSTable, so the WAL that
-			// covered it can be discarded. If truncation fails we keep the WAL;
-			// replay on next startup is idempotent (same keys re-inserted).
-			if e.wal != nil {
-				if err := e.wal.Truncate(); err != nil {
-					e.logger.WithError(err).Warn("Failed to truncate WAL after final flush")
-				}
-			}
-		}
-	} else {
-		e.mutex.Unlock()
+		err := fmt.Errorf("%d MemTables could not be flushed (%v); %s", unflushed, e.flushErr, lost)
+		e.logger.WithError(err).Error("Unflushed MemTables at shutdown")
+		shutdownErrors = append(shutdownErrors, err)
 	}
+	e.mutex.Unlock()
 
 	// Close the write-ahead log now that no further writes will occur.
 	if e.wal != nil {
@@ -571,6 +590,8 @@ func (e *Engine) CrashForTesting() {
 		return
 	}
 	e.closed = true
+	e.crashed = true
+	e.flushCond.Broadcast()
 	e.mutex.Unlock()
 
 	close(e.stopChan)
@@ -597,17 +618,7 @@ func (e *Engine) triggerCompaction() {
 func (e *Engine) startBackgroundWorkers() {
 	// Flush worker
 	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		for {
-			select {
-			case <-e.flushChan:
-				e.performFlush()
-			case <-e.stopChan:
-				return
-			}
-		}
-	}()
+	go e.flushWorker()
 
 	// Compaction worker
 	e.wg.Add(1)
@@ -624,102 +635,211 @@ func (e *Engine) startBackgroundWorkers() {
 	}()
 }
 
-// performFlush flushes the active MemTable to an SSTable.
-func (e *Engine) performFlush() {
-	tracker := metrics.NewLatencyTracker()
-	e.logger.Info("Starting MemTable flush")
+// memTableFullLocked reports whether the active MemTable has reached its size
+// limit. Caller must hold e.mutex.
+func (e *Engine) memTableFullLocked() bool {
+	return e.activeMemTable.Size() >= int64(e.config.MemTableMaxSize)
+}
 
-	e.mutex.Lock()
+// maxSealedMemTables is how many sealed MemTables may wait for the flush
+// worker: MaxMemTables counts the active one too.
+func (e *Engine) maxSealedMemTables() int {
+	if e.config.MaxMemTables > 1 {
+		return e.config.MaxMemTables - 1
+	}
+	return 1
+}
 
-	// Move active MemTable to flushing list. Its generation is fixed now, at
-	// rotation, so tables stay in data order even if flushes finish out of order.
-	flushingMemTable := e.activeMemTable
-	flushingMemTable.SetReadOnly()
-	e.flushingMemTables = append(e.flushingMemTables, flushingMemTable)
-	gen := e.nextGen
-	e.nextGen++
+// maybeSealLocked seals the active MemTable if it is full and the flush queue
+// has room. Caller must hold e.mutex.
+func (e *Engine) maybeSealLocked() {
+	if e.memTableFullLocked() && len(e.flushingMemTables) < e.maxSealedMemTables() {
+		e.sealLocked()
+	}
+}
 
-	// Create new active MemTable
-	e.activeMemTable = NewMemTable()
-	memTableCount := len(e.flushingMemTables) + 1
-	e.metrics.Storage().MemTableCount.Store(int64(memTableCount))
-
-	// Seal the current WAL segment atomically with the MemTable swap. Records
-	// for the MemTable we're about to flush are now in the sealed segment;
-	// writes that arrive during the flush go to the fresh active log and are
-	// preserved. We remove the sealed segment only after the SSTable is durable.
-	var sealedWALSegment string
-	if e.wal != nil {
-		var walErr error
-		sealedWALSegment, walErr = e.wal.Rotate()
-		if walErr != nil {
-			e.logger.WithError(walErr).Error("Failed to rotate WAL during flush")
-			// Continue with the flush: correctness of the data is unaffected,
-			// we just won't be able to reclaim the old WAL space this round.
+// waitForMemTableRoomLocked applies backpressure: while the active MemTable is
+// full and cannot be sealed because the flush queue is full, the writer waits
+// for a flush to finish. It returns an error instead if the engine closes or
+// the last flush failed, rather than waiting on retries that may never
+// succeed. Writes do not wait while the active MemTable has room, even during
+// a flush. Caller must hold e.mutex; it is released while waiting.
+func (e *Engine) waitForMemTableRoomLocked() error {
+	for e.memTableFullLocked() {
+		if e.closed {
+			return errors.NewStorageClosedError()
+		}
+		if len(e.flushingMemTables) < e.maxSealedMemTables() {
+			e.sealLocked()
+			return nil
+		}
+		if e.flushErr != nil {
+			return errors.Wrap(e.flushErr, errors.ErrCodeInternal,
+				"MemTables are full and flushing them is failing")
+		}
+		e.stalledWriters++
+		e.flushCond.Wait()
+		e.stalledWriters--
+		if e.closed {
+			// Close may have sealed the MemTable this writer waited for
+			return errors.NewStorageClosedError()
 		}
 	}
+	return nil
+}
 
-	e.mutex.Unlock()
+// sealLocked makes the active MemTable read-only, queues it for the flush
+// worker and starts a new one. In the same critical section it rotates the
+// WAL, so the sealed segment holds exactly the sealed MemTable's writes and
+// every later write goes to the new log. The segment is named after the
+// MemTable's generation, which recovery uses to order it among SSTables.
+// Caller must hold e.mutex.
+func (e *Engine) sealLocked() {
+	sealed := e.activeMemTable
+	sealed.SetReadOnly()
+	sealed.gen = e.nextGen
+	e.nextGen++
 
-	// Create sstables subdirectory if it doesn't exist
+	if e.wal != nil {
+		segment, err := e.wal.Rotate(sealed.gen)
+		if err != nil {
+			// If the rename did not happen, the sealed MemTable's records stay
+			// in the active log ahead of later writes; recovery replays them in
+			// order, so nothing is lost, only that space is not reclaimed
+			e.logger.WithError(err).Error("Failed to rotate WAL while sealing a MemTable")
+		}
+		sealed.walSegment = segment
+	}
+
+	e.flushingMemTables = append(e.flushingMemTables, sealed)
+	e.activeMemTable = NewMemTable()
+	e.metrics.Storage().MemTableCount.Store(int64(len(e.flushingMemTables) + 1))
+
+	select {
+	case e.flushChan <- struct{}{}:
+	default: // The worker is already signalled
+	}
+}
+
+// flushWorker writes sealed MemTables to SSTables, oldest first and one at a
+// time. A failed flush is retried with a growing delay, and later MemTables
+// wait: flushing a newer one first would leave the older one in memory, where
+// reads find it ahead of the newer SSTable. On stop it first drains the queue,
+// giving up at the first failure; the WAL segments of anything not flushed
+// remain for recovery.
+func (e *Engine) flushWorker() {
+	defer e.wg.Done()
+	var delay time.Duration // Until the next retry; 0 after a success
+	for {
+		memTable := e.nextMemTableToFlush()
+		if memTable == nil {
+			select {
+			case <-e.flushChan:
+			case <-e.stopChan:
+				if e.nextMemTableToFlush() == nil {
+					return
+				}
+			}
+			continue
+		}
+
+		if err := e.flushMemTable(memTable); err != nil {
+			if delay = 2 * delay; delay == 0 {
+				delay = e.flushRetryMin
+			}
+			if delay > e.flushRetryMax {
+				delay = e.flushRetryMax
+			}
+			e.mutex.Lock()
+			e.flushErr = err
+			e.flushCond.Broadcast()
+			e.mutex.Unlock()
+			e.metrics.Storage().FlushErrors.Add(1)
+			e.logger.WithError(err).WithFields(map[string]interface{}{
+				"generation": memTable.gen,
+				"retryIn":    delay.String(),
+			}).Error("MemTable flush failed")
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-e.stopChan:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		delay = 0
+	}
+}
+
+// nextMemTableToFlush returns the oldest sealed MemTable, or nil if there is
+// none or the engine crashed.
+func (e *Engine) nextMemTableToFlush() *MemTable {
+	e.mutex.RLock()
+	defer e.mutex.RUnlock()
+	if e.crashed || len(e.flushingMemTables) == 0 {
+		return nil
+	}
+	return e.flushingMemTables[0]
+}
+
+// flushMemTable writes a sealed MemTable to an SSTable and installs it. On
+// failure the MemTable stays queued and readable, and its WAL segment is kept.
+func (e *Engine) flushMemTable(memTable *MemTable) error {
+	tracker := metrics.NewLatencyTracker()
+	e.mutex.RLock()
+	gen, segment := memTable.gen, memTable.walSegment
+	e.mutex.RUnlock()
+
 	sstablesDir := filepath.Join(e.dataDir, "sstables")
 	if err := os.MkdirAll(sstablesDir, 0755); err != nil {
-		e.logger.WithError(err).Error("Failed to create sstables directory")
-		e.metrics.Storage().FlushErrors.Add(1)
-		return
+		return fmt.Errorf("failed to create sstables directory: %w", err)
 	}
-
-	// Generate SSTable file path; the name records the generation for reload
-	fileName := fmt.Sprintf("sstable_%d.db", gen)
-	filePath := filepath.Join(sstablesDir, fileName)
-
-	// Create SSTable from MemTable
-	e.logger.WithField("path", filePath).Info("Creating SSTable")
-	sstable, err := CreateSSTable(flushingMemTable, filePath, e.config)
+	// The name records the generation for reload
+	filePath := filepath.Join(sstablesDir, fmt.Sprintf("sstable_%d.db", gen))
+	sstable, err := e.createSSTable(memTable, filePath)
 	if err != nil {
-		e.logger.WithError(err).Error("Failed to create SSTable")
-		e.metrics.Storage().FlushErrors.Add(1)
-		return
+		return fmt.Errorf("failed to create SSTable %s: %w", filePath, err)
 	}
 
-	// Add SSTable to level 0 (newest level), in generation order
+	// Swap the MemTable for its SSTable in one critical section, so reads
+	// find the data in exactly one of them
 	e.mutex.Lock()
 	sstable.level = 0
 	sstable.gen = gen
 	e.sstables[0] = insertByGen(e.sstables[0], sstable)
+	e.flushingMemTables = e.flushingMemTables[1:] // memTable is always the oldest
+	e.memoryMonitor.RecordMemTableDeallocation(memTable.accounted)
+	e.flushErr = nil
 
 	totalSSTables := 0
 	for level := range e.sstables {
 		totalSSTables += len(e.sstables[level])
 	}
 	e.metrics.Storage().SSTableCount.Store(int64(totalSSTables))
-
-	// Remove from flushing list; its data now lives on disk, so its memory no
-	// longer counts against the MemTable limit
-	for i, mt := range e.flushingMemTables {
-		if mt == flushingMemTable {
-			e.flushingMemTables = append(e.flushingMemTables[:i], e.flushingMemTables[i+1:]...)
-			break
-		}
-	}
-	e.memoryMonitor.RecordMemTableDeallocation(flushingMemTable.accounted)
-
+	e.metrics.Storage().MemTableCount.Store(int64(len(e.flushingMemTables) + 1))
 	level0Count := len(e.sstables[0])
 	needsCompaction := level0Count >= e.config.CompactionThreshold
+
+	// The queue has room again: seal a MemTable that filled up meanwhile and
+	// release writers held back by backpressure
+	if !e.closed {
+		e.maybeSealLocked()
+	}
+	e.flushCond.Broadcast()
 	e.mutex.Unlock()
 
-	// The flushed MemTable is now durable in an SSTable (CreateSSTable fsyncs
-	// the files and their directory), so the sealed WAL segment that covered
-	// it is no longer needed for recovery and can be reclaimed. Writes that arrived during the flush are in the fresh active
-	// log and are untouched.
-	if sealedWALSegment != "" {
-		if err := RemoveSegment(sealedWALSegment); err != nil {
-			e.logger.WithError(err).WithField("segment", sealedWALSegment).
+	// The SSTable is durable (CreateSSTable fsyncs its files and directory),
+	// so the sealed WAL segment that covered it can go. Writes that arrived
+	// during the flush are in newer segments or the active log.
+	if segment != "" {
+		if err := RemoveSegment(segment); err != nil {
+			e.logger.WithError(err).WithField("segment", segment).
 				Warn("Failed to remove sealed WAL segment after flush")
 		}
 	}
 
-	// Update metrics
 	e.metrics.Storage().FlushCount.Add(1)
 	e.metrics.Storage().FlushDurationNs.Store(tracker.Finish())
 	e.logger.WithFields(map[string]interface{}{
@@ -728,12 +848,12 @@ func (e *Engine) performFlush() {
 		"totalSSTableCount":  totalSSTables,
 	}).Info("SSTable created successfully")
 
-	// Check if compaction is needed (for level 0)
 	if needsCompaction {
 		e.logger.WithField("level0SSTableCount", level0Count).
 			Info("Level 0 SSTable count exceeded threshold, triggering compaction")
 		e.triggerCompaction()
 	}
+	return nil
 }
 
 // performCompaction merges multiple SSTables into fewer, larger files.
@@ -1172,112 +1292,79 @@ func (e *Engine) walPath() string {
 	return filepath.Join(e.dataDir, walFileName)
 }
 
-// recoverWAL replays any records in the write-ahead log into the active
-// MemTable, then opens the log for appending. It runs during NewEngine, after
-// SSTables are loaded, so replayed entries correctly shadow older on-disk
-// versions. Replaying before opening the writable handle ensures we don't
-// re-append the records we're recovering.
+// recoverWAL recovers the writes held only in the write-ahead log, then opens
+// the log for appending. It runs during NewEngine, after SSTables are loaded.
 //
-// Replay tolerates a torn final record (a crash mid-append); see ReplayWAL.
+// Sealed segments belong to MemTables that were sealed but not flushed. Each
+// is written to the SSTable its MemTable would have become, with the
+// generation in its name, so it takes its place among the other SSTables by
+// age; replaying it into the active MemTable instead would put old writes
+// ahead of every newer SSTable. A segment whose SSTable already exists (a
+// crash after the flush, before the segment's removal) is just removed. Each
+// segment is removed only once its SSTable is durable.
+//
+// The active log holds the newest writes and is replayed into the active
+// MemTable. Replay tolerates a torn final record (a crash mid-append); see
+// ReplayWAL.
 func (e *Engine) recoverWAL() error {
 	path := e.walPath()
-	rewritePath := path + ".rewrite"
 
-	// A rewrite left by a crash during an earlier recovery is incomplete or
-	// was never renamed into place; the files it was built from are intact.
-	if err := os.Remove(rewritePath); err != nil && !os.IsNotExist(err) {
+	// Older versions rewrote the log during recovery via this temporary file;
+	// one left by a crash is incomplete, and the files it came from are intact
+	if err := os.Remove(path + ".rewrite"); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove leftover WAL rewrite: %w", err)
 	}
 
-	// Sealed segments are left behind by a crash after a WAL rotation but
-	// before the corresponding SSTable was durable. They are named
-	// "<wal>.<nanos>.sealed"; sorting by name orders them oldest-first, which
-	// is the order in which their writes originally happened.
-	sealed, err := filepath.Glob(path + ".*.sealed")
+	segments, err := filepath.Glob(path + ".*.sealed")
 	if err != nil {
 		return fmt.Errorf("failed to list sealed WAL segments: %w", err)
 	}
-	sort.Strings(sealed)
 
-	// Replayed records go into the active MemTable, which only becomes
-	// durable at the next flush. If there are sealed segments, also copy
-	// every record, in replay order, into a fresh log, so the segments can
-	// be removed without their records existing only in memory: a second
-	// crash before that flush must still find them.
-	var rewrite *WAL
-	if len(sealed) > 0 {
-		if rewrite, err = OpenWAL(rewritePath, false); err != nil {
-			return fmt.Errorf("failed to open WAL rewrite: %w", err)
+	// Segments from older versions ("<wal>.<nanos>.sealed") carry no
+	// generation. They predate this version's first start, so no segment
+	// with a generation can exist alongside them; as before, they rank above
+	// every SSTable, in name (time) order.
+	type sealedSegment struct {
+		path string
+		gen  uint64
+	}
+	var ordered, legacy []sealedSegment
+	for _, segment := range segments {
+		if gen, ok := parseSealedSegmentGen(path, segment); ok {
+			ordered = append(ordered, sealedSegment{segment, gen})
+			if gen >= e.nextGen {
+				e.nextGen = gen + 1
+			}
+		} else {
+			legacy = append(legacy, sealedSegment{path: segment})
 		}
-		defer func() {
-			if rewrite != nil {
-				_ = rewrite.Close()
-				_ = os.Remove(rewritePath)
-			}
-		}()
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].gen < ordered[j].gen })
+	sort.Slice(legacy, func(i, j int) bool { return legacy[i].path < legacy[j].path })
+	for i := range legacy {
+		legacy[i].gen = e.nextGen
+		e.nextGen++
 	}
 
-	replayInto := func(p string) (int, error) {
-		return ReplayWAL(p, func(entry *Entry) error {
-			// Insert directly into the active MemTable, bypassing Put so we don't
-			// re-append to the WAL during recovery. Later records for the same key
-			// overwrite earlier ones, matching the original write order.
-			if rewrite != nil {
-				if err := rewrite.Append(entry); err != nil {
-					return err
-				}
-			}
-			return e.activeMemTable.Put(*entry)
-		})
-	}
-
-	total := 0
-	for _, seg := range sealed {
-		n, err := replayInto(seg)
-		if err != nil {
+	for _, segment := range append(ordered, legacy...) {
+		if err := e.recoverSegment(segment.path, segment.gen); err != nil {
 			return err
 		}
-		total += n
 	}
 
-	// Replay the active log last: its writes are the most recent.
-	n, err := replayInto(path)
+	// Replay the active log last: its writes are the most recent. Insert
+	// directly into the active MemTable so they are not re-appended to the
+	// log. Later records for the same key overwrite earlier ones, matching
+	// the original write order.
+	recovered, err := ReplayWAL(path, func(entry *Entry) error {
+		return e.activeMemTable.Put(*entry)
+	})
 	if err != nil {
 		return err
 	}
-	total += n
-
-	if total > 0 {
-		e.logger.WithField("recoveredRecords", total).
+	if recovered > 0 {
+		e.logger.WithField("recoveredRecords", recovered).
 			Info("Recovered writes from write-ahead log")
-	}
-
-	if rewrite != nil {
-		// Make the rewritten log durable, swap it in atomically, and persist
-		// the rename. A crash before the rename leaves the original files; a
-		// crash after it leaves the segments too, which replay harmlessly
-		// before the rewritten log that already contains them.
-		if err := rewrite.Sync(); err != nil {
-			return fmt.Errorf("failed to sync WAL rewrite: %w", err)
-		}
-		if err := rewrite.Close(); err != nil {
-			return fmt.Errorf("failed to close WAL rewrite: %w", err)
-		}
-		rewrite = nil
-		if err := os.Rename(rewritePath, path); err != nil {
-			return fmt.Errorf("failed to install WAL rewrite: %w", err)
-		}
-		if err := syncDir(filepath.Dir(path)); err != nil {
-			return err
-		}
-
-		// Only now are the segments' records durable elsewhere
-		for _, seg := range sealed {
-			if err := RemoveSegment(seg); err != nil {
-				e.logger.WithError(err).WithField("segment", seg).
-					Warn("Failed to remove replayed sealed WAL segment")
-			}
-		}
 	}
 
 	// Open (or create) the log for subsequent appends. Existing records are
@@ -1289,6 +1376,61 @@ func (e *Engine) recoverWAL() error {
 	}
 	e.wal = wal
 	return nil
+}
+
+// recoverSegment writes a sealed WAL segment to an SSTable of generation gen
+// and removes the segment.
+func (e *Engine) recoverSegment(segment string, gen uint64) error {
+	memTable := NewMemTable()
+	if !e.hasSSTableGen(gen) {
+		recovered, err := ReplayWAL(segment, func(entry *Entry) error {
+			return memTable.Put(*entry)
+		})
+		if err != nil {
+			return err
+		}
+		e.logger.WithFields(map[string]interface{}{
+			"segment":          segment,
+			"generation":       gen,
+			"recoveredRecords": recovered,
+		}).Info("Recovering sealed WAL segment into an SSTable")
+	}
+
+	if memTable.Size() > 0 {
+		sstablesDir := filepath.Join(e.dataDir, "sstables")
+		if err := os.MkdirAll(sstablesDir, 0755); err != nil {
+			return fmt.Errorf("failed to create sstables directory: %w", err)
+		}
+		sstable, err := e.createSSTable(memTable, filepath.Join(sstablesDir, fmt.Sprintf("sstable_%d.db", gen)))
+		if err != nil {
+			return fmt.Errorf("failed to write SSTable for WAL segment %s: %w", segment, err)
+		}
+		sstable.level = 0
+		sstable.gen = gen
+		e.sstables[0] = insertByGen(e.sstables[0], sstable)
+	}
+
+	// Only now are the segment's records durable elsewhere. Persist the
+	// removal too: a legacy segment that came back would be recovered again
+	// with a newer generation than the data written after it
+	if err := RemoveSegment(segment); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(segment))
+}
+
+// hasSSTableGen reports whether any loaded SSTable has generation gen. A
+// compaction output takes the generation of its newest input, so it also
+// counts: it holds everything that input held.
+func (e *Engine) hasSSTableGen(gen uint64) bool {
+	for _, tables := range e.sstables {
+		for _, table := range tables {
+			if table.gen == gen {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // loadExistingSSTables scans the data directory and opens existing SSTables.
@@ -1324,19 +1466,25 @@ func (e *Engine) loadExistingSSTables() error {
 		e.sstables[level] = insertByGen(e.sstables[level], sstable)
 	}
 
-	if !e.levelsOrderedLocked() {
-		e.logger.Warn("SSTable levels out of order (compaction interrupted by a crash), loading all tables into level 0")
-		var all []*SSTable
-		for level := range e.sstables {
-			for _, sstable := range e.sstables[level] {
-				all = insertByGen(all, sstable)
-			}
-			e.sstables[level] = make([]*SSTable, 0)
-		}
-		e.sstables[0] = all
-	}
-
 	return nil
+}
+
+// flattenLevelsIfOutOfOrder moves every SSTable into level 0, in generation
+// order, if the levels are out of order (see levelsOrderedLocked). Run at
+// startup, after recovery has added its SSTables.
+func (e *Engine) flattenLevelsIfOutOfOrder() {
+	if e.levelsOrderedLocked() {
+		return
+	}
+	e.logger.Warn("SSTable levels out of order (compaction or flush interrupted by a crash), loading all tables into level 0")
+	var all []*SSTable
+	for level := range e.sstables {
+		for _, sstable := range e.sstables[level] {
+			all = insertByGen(all, sstable)
+		}
+		e.sstables[level] = make([]*SSTable, 0)
+	}
+	e.sstables[0] = all
 }
 
 // levelsOrderedLocked reports whether every table holds newer data than every
@@ -1344,8 +1492,10 @@ func (e *Engine) loadExistingSSTables() error {
 // A compaction keeps this true in memory, but a crash after writing its
 // output and before deleting its inputs leaves inputs on disk at a shallower
 // level than an output with the same or newer generation; the output may
-// even be partial. Generation order alone stays correct in that case, since
-// an output's generation is that of its newest input.
+// even be partial. Likewise, recovery may write a sealed WAL segment to a
+// level-0 table older than data already compacted below it. Generation order
+// alone stays correct in those cases, since an output's generation is that of
+// its newest input.
 func (e *Engine) levelsOrderedLocked() bool {
 	var maxBelow uint64
 	seenBelow := false

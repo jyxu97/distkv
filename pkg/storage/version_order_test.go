@@ -37,6 +37,7 @@ func writeRounds(t *testing.T, e *Engine, keys, rounds int) {
 			}
 		}
 	}
+	waitForFlushes(e)
 }
 
 // assertNewest checks that both point lookups and full iteration return the
@@ -179,7 +180,7 @@ func TestIteratorMergesUnsortedMemTable(t *testing.T) {
 	for k := 0; k < keys; k++ {
 		put(k, 1)
 	}
-	e.performFlush() // v1 for every key now lives in an SSTable
+	flushNow(e) // v1 for every key now lives in an SSTable
 	for k := keys - 1; k >= 0; k-- {
 		put(k, 2) // Newer versions in the MemTable, in reverse key order
 	}

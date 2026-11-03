@@ -31,8 +31,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
-	"time"
 )
 
 // walRecordHeaderSize is the fixed size of the per-record header:
@@ -182,7 +183,8 @@ func (w *WAL) Truncate() error {
 	return nil
 }
 
-// Rotate seals the current log by renaming it to a sidecar segment and starts a
+// Rotate seals the current log by renaming it to a sidecar segment named after
+// gen, the generation of the MemTable whose writes it holds, and starts a
 // fresh, empty active log at the original path. It returns the path of the
 // sealed segment. Records appended after Rotate go to the new active log; the
 // sealed segment still describes the MemTable being flushed and must be
@@ -191,7 +193,9 @@ func (w *WAL) Truncate() error {
 // This is the mechanism that makes WAL truncation safe under concurrent writes:
 // a write that arrives during a flush lands in the new active log and is never
 // discarded when the sealed segment for the flushed MemTable is removed.
-func (w *WAL) Rotate() (string, error) {
+//
+// If the rename happened, the segment path is returned even with an error.
+func (w *WAL) Rotate(gen uint64) (string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -208,7 +212,7 @@ func (w *WAL) Rotate() (string, error) {
 		return "", fmt.Errorf("wal: close before rotate failed: %w", err)
 	}
 
-	sealedPath := fmt.Sprintf("%s.%d.sealed", w.path, time.Now().UnixNano())
+	sealedPath := sealedSegmentPath(w.path, gen)
 	if err := os.Rename(w.path, sealedPath); err != nil {
 		// Best-effort reopen so the WAL remains usable on failure.
 		if f, reopenErr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600); reopenErr == nil {
@@ -220,7 +224,7 @@ func (w *WAL) Rotate() (string, error) {
 
 	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
-		return "", fmt.Errorf("wal: failed to open fresh log after rotate: %w", err)
+		return sealedPath, fmt.Errorf("wal: failed to open fresh log after rotate: %w", err)
 	}
 	w.file = file
 	w.writer = bufio.NewWriter(file)
@@ -232,6 +236,25 @@ func (w *WAL) Rotate() (string, error) {
 		return sealedPath, fmt.Errorf("wal: %w", err)
 	}
 	return sealedPath, nil
+}
+
+// sealedSegmentPath names the segment holding the writes of MemTable
+// generation gen: "<wal>.g<gen>.sealed".
+func sealedSegmentPath(walPath string, gen uint64) string {
+	return fmt.Sprintf("%s.g%d.sealed", walPath, gen)
+}
+
+// parseSealedSegmentGen returns the generation in a segment path made by
+// sealedSegmentPath. Segments from older versions, named
+// "<wal>.<nanos>.sealed", have no generation and report false.
+func parseSealedSegmentGen(walPath, segment string) (uint64, bool) {
+	middle := strings.TrimSuffix(strings.TrimPrefix(segment, walPath+"."), ".sealed")
+	digits, ok := strings.CutPrefix(middle, "g")
+	if !ok {
+		return 0, false
+	}
+	gen, err := strconv.ParseUint(digits, 10, 64)
+	return gen, err == nil
 }
 
 // syncDir fsyncs a directory so that files created, renamed or removed in it

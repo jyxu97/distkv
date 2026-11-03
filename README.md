@@ -7,7 +7,7 @@ Distributed key-value store built from scratch in Go, inspired by Amazon's Dynam
 - **Fault Tolerance**: Quorum replication (N=3, R=2, W=2) sustains reads and writes through single-node failures
 - **Tunable Consistency**: N/R/W quorum parameters set per server at startup, and a per-request consistency level (ONE/QUORUM/ALL) for reads, or for writes that need more acks than W
 - **Persistent Storage**: LSM-tree storage engine with MemTables, SSTables, Bloom filters, and compaction
-- **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL covering them is deleted, crash recovery keeps replayed records durable until they are flushed again, and a compaction interrupted by a crash never lets its old input tables shadow newer output
+- **Durability**: Each write is appended to a write-ahead log and fsynced before it is acknowledged; SSTables are fsynced before the WAL segment covering them is deleted, a flush that fails is retried and keeps its WAL segment meanwhile, recovery writes leftover segments to SSTables in their original order so older writes never shadow newer ones, and a compaction interrupted by a crash never lets its old input tables shadow newer output
 - **Gossip Protocol**: Network-based gossip for cluster membership and failure detection
 - **Consistent Hashing**: Virtual node-based partitioning; new nodes propagate to all peers' hash rings within one gossip interval via event callbacks
 - **Vector Clocks**: Conflict detection and causality tracking with Dynamo-style sibling preservation
@@ -95,7 +95,7 @@ make stop-cluster
 
 ### Key Technologies
 
-- **Storage Engine**: LSM-tree with a write-ahead log, 64 MB MemTables, SSTables, and Bloom filters. Level-based compaction by default: 4 level-0 SSTables trigger a merge into level 1, and each deeper level holds 10x more tables (7 levels). Expired tombstones are dropped only in the bottom level, so they cannot uncover older data below them. `-compaction-strategy=simple` instead merges level 0 into one table
+- **Storage Engine**: LSM-tree with a write-ahead log, 64 MB MemTables, SSTables, and Bloom filters. A full MemTable is sealed (with a WAL rotation) and flushed by a background worker, so writes continue in a new MemTable during the flush; only when one sealed MemTable is still waiting and the new one fills up too do writers wait (`MaxMemTables`, default 2), and they fail instead of waiting while flushing keeps failing. Level-based compaction by default: 4 level-0 SSTables trigger a merge into level 1, and each deeper level holds 10x more tables (7 levels). Expired tombstones are dropped only in the bottom level, so they cannot uncover older data below them. `-compaction-strategy=simple` instead merges level 0 into one table
 - **Partitioning**: Consistent hashing with 150 virtual nodes
 - **Replication**: Quorum-based consensus (default: N=3, R=2, W=2)
 - **Conflict Resolution**: Vector clocks with Dynamo-style sibling preservation
